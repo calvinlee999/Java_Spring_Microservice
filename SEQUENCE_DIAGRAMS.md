@@ -1,254 +1,272 @@
-# Sequence Diagrams — `spring-data-3-5959699`
+# University Modern — Sequence Diagrams
 
-> End-to-end request flows for both modules, from HTTP Client through all application layers down to the database.
+> **Module:** `university-modern` · Spring Boot 3.2+ · Java 17/21  
+> End-to-end request flows from HTTP client through all application layers to PostgreSQL.
 
 ---
 
 ## Diagram Index
 
-| Diagram | Module | Server | Database | Pattern |
-|---|---|---|---|---|
-| [college Request Flow](#college-module--request-sequence) | `college` | Netty (WebFlux) | MongoDB :27017 | Reactive, non-blocking, `Flux`/`Mono` |
-| [university Request Flow](#university-module--request-sequence) | `university` | Tomcat (Spring MVC) | PostgreSQL :5432 | Blocking, thread-per-request, JPA |
+| # | Flow | Entry Point | Key Feature |
+|---|---|---|---|
+| 1 | [List all courses](#flow-1-list-all-courses) | `GET /api/courses` | Service → Repo → DB happy path |
+| 2 | [Get course by ID — not found](#flow-2-get-course-by-id--404-problemdetail) | `GET /api/courses/{id}` | RFC-7807 ProblemDetail error response |
+| 3 | [Dynamic filter — Specification](#flow-3-dynamic-filter--jpa-specification) | `GET /api/courses/filter` | `CourseFilter` → JPA Specification |
+| 4 | [Dynamic filter — QueryDSL](#flow-4-dynamic-filter--querydsl) | `GET /api/courses/querydsl` | `BooleanBuilder` + Q-types |
+| 5 | [SequencedCollection reversed](#flow-5-sequencedcollection--reversed-courses) | `GET /api/courses/reversed` | Java 21 `List.reversed()` |
 
 ---
 
-## `college` Module — Request Sequence
+## Flow 1: List All Courses
 
-> **Stack:** `CollegeApplication` → Netty Event Loop → WebFlux Router → `ReactiveCrudRepository` → Spring Data MongoDB Reactive Driver → **MongoDB**  
-> **Key characteristic:** No thread is ever blocked during I/O. The Netty event loop thread stays free while MongoDB responds.
+> **Stack:** `CourseController` → `UniversityService` → `CourseRepo` → Hibernate → PostgreSQL  
+> **Characteristic:** Blocking, thread-per-request (Spring MVC / Tomcat). Simple happy-path CRUD read.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Client as HTTP Client
-    participant Netty as Netty Event Loop (WebFlux)
-    participant Router as WebFlux Router / REST Handler
-    participant SwaggerUI as Swagger UI (springdoc-webflux 2.5.0)
-    participant StaffRepo as StaffRepo (ReactiveCrudRepository)
-    participant DeptRepo as DepartmentRepo (ReactiveCrudRepository)
-    participant ReactiveDriver as Spring Data MongoDB Reactive Driver
-    participant MongoDB as MongoDB (Docker Compose :27017)
+    participant CC as CourseController
+    participant US as UniversityService
+    participant CR as CourseRepo
+    participant HB as Hibernate ORM
+    participant PG as PostgreSQL
 
-    Note over Client,MongoDB: college module — Reactive Non-Blocking Pipeline
+    Note over Client,PG: GET /api/courses - list all courses
 
-    Client->>+Netty: HTTP GET /swagger-ui.html
-    Netty->>+SwaggerUI: serve OpenAPI spec
-    SwaggerUI-->>-Netty: HTML/JS assets
-    Netty-->>-Client: 200 OK (API docs rendered)
-
-    Client->>+Netty: HTTP GET /staff/{id}
-    Netty->>+Router: route to Staff handler
-    Router->>+StaffRepo: findById(id) returns Mono of Staff
-    StaffRepo->>+ReactiveDriver: reactive find query
-    ReactiveDriver->>+MongoDB: _id ObjectId lookup
-    MongoDB-->>-ReactiveDriver: BSON document
-    ReactiveDriver-->>-StaffRepo: Mono of Staff (subscribed)
-    StaffRepo-->>-Router: Mono of Staff
-    Router-->>-Netty: Mono of Staff (assembled)
-    Netty-->>-Client: 200 OK JSON { id, member }
-    Note right of Netty: No thread blocked during I/O wait
-
-    Client->>+Netty: HTTP GET /department?namePattern=.*Science.*
-    Netty->>+Router: route to Department handler
-    Router->>+DeptRepo: findNameByPattern(pattern) returns Flux of Department
-    DeptRepo->>+ReactiveDriver: reactive regex query
-    ReactiveDriver->>+MongoDB: name $regex query
-    MongoDB-->>-ReactiveDriver: BSON cursor (streaming)
-    ReactiveDriver-->>-DeptRepo: Flux of Department (hot stream)
-    DeptRepo-->>-Router: Flux of Department
-    Router-->>-Netty: Server-Sent Events stream
-    Netty-->>-Client: 200 OK (streaming JSON array)
-    Note right of MongoDB: Flux streams each document as emitted - backpressure applied
-
-    Client->>+Netty: HTTP POST /staff (body: firstName, lastName)
-    Netty->>+Router: route to Staff create handler
-    Router->>+StaffRepo: save(new Staff(person)) returns Mono of Staff
-    StaffRepo->>+ReactiveDriver: reactive insert
-    ReactiveDriver->>+MongoDB: insertOne member document
-    MongoDB-->>-ReactiveDriver: inserted ObjectId
-    ReactiveDriver-->>-StaffRepo: Mono of Staff (with generated id)
-    StaffRepo-->>-Router: Mono of Staff
-    Router-->>-Netty: Mono of Staff
-    Netty-->>-Client: 201 Created { id, member }
+    Client->>+CC: GET /api/courses
+    CC->>+US: findAllCourses()
+    US->>+CR: findAll()
+    CR->>+HB: execute SELECT query
+    HB->>+PG: SELECT c.*, s.*, d.* FROM course c JOIN staff_member s JOIN department d
+    PG-->>-HB: ResultSet rows
+    HB-->>-CR: List of Course entities
+    CR-->>-US: List of Course
+    US-->>-CC: List of Course
+    CC-->>-Client: 200 OK - JSON array of courses
 ```
 
-### college — Layer Call Chain
+### Flow 1 — Layer Call Chain
 
 ```
 HTTP Client
-    │ HTTP request
+    │ GET /api/courses
     ▼
-Netty Event Loop  (spring-boot-starter-webflux → auto-configures Netty)
-    │ dispatches via WebFlux dispatcher
+CourseController  (@RestController — Spring MVC Tomcat thread)
+    │ findAllCourses()
     ▼
-WebFlux Router / REST Handler
-    │ calls repository method returning Mono<T> or Flux<T>
+UniversityService  (@Service — CRUD facade)
+    │ findAll()
     ▼
-StaffRepo / DepartmentRepo  (ReactiveCrudRepository<T, String>)
-    │ Spring Data generates reactive query execution
+CourseRepo  (JpaRepository<Course, Integer>)
+    │ Spring Data generates SELECT JPQL
     ▼
-Spring Data MongoDB Reactive Driver  (spring-boot-starter-data-mongodb-reactive)
-    │ non-blocking TCP to MongoDB
-    ▼
-MongoDB  (Docker Compose :27017)
-    │ BSON response streams back
-    ▼
-Reactive pipeline assembles result → subscriber (Netty) emits HTTP response
-```
-
----
-
-## `university` Module — Request Sequence
-
-> **Stack:** `UniversityApplication` → Tomcat thread pool → Spring Data REST HAL / Service Layer → Repository Layer → JPA / Hibernate → **PostgreSQL**  
-> **Key characteristic:** Each request occupies a Tomcat thread for its full duration. Adding `spring.threads.virtual.enabled=true` (Spring Boot 3.2+) eliminates this bottleneck without any code changes.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client as HTTP Client
-    participant Tomcat as Tomcat Thread Pool (Spring MVC)
-    participant DataREST as Spring Data REST HAL Controller
-    participant SwaggerUI as Swagger UI (springdoc-webmvc 2.5.0)
-    participant UniSvc as UniversityService @Service
-    participant DynSvc as DynamicQueryService @Service
-    participant StaffRepo as StaffRepo (JpaRepository + @RepositoryRestResource)
-    participant StudentRepo as StudentRepo (JpaRepository)
-    participant CourseRepo as CourseRepo (JpaRepository + JpaSpecificationExecutor)
-    participant QDSLRepo as CourseQueryDslRepo (QuerydslPredicateExecutor)
-    participant Hibernate as Hibernate ORM (JPA Provider)
-    participant PG as PostgreSQL (Docker Compose :5432)
-
-    Note over Client,PG: university module — Blocking Request/Response (Spring MVC)
-
-    Client->>+Tomcat: HTTP GET /swagger-ui.html
-    Tomcat->>+SwaggerUI: serve OpenAPI spec
-    SwaggerUI-->>-Tomcat: HTML/JS assets
-    Tomcat-->>-Client: 200 OK (API docs rendered)
-
-    Client->>+Tomcat: HTTP GET /staff (HAL)
-    Tomcat->>+DataREST: dispatch to StaffRepo HAL handler
-    DataREST->>+StaffRepo: findAll() via @RepositoryRestResource
-    StaffRepo->>+Hibernate: SELECT s FROM Staff s (JPQL)
-    Hibernate->>+PG: SELECT * FROM staff JOIN person
-    PG-->>-Hibernate: ResultSet rows
-    Hibernate-->>-StaffRepo: List of Staff
-    StaffRepo-->>-DataREST: List of Staff
-    DataREST-->>-Tomcat: HAL+JSON _embedded _links
-    Tomcat-->>-Client: 200 OK HAL response
-    Note right of Tomcat: Tomcat thread blocked during full DB round-trip. Add spring.threads.virtual.enabled=true to free the OS thread.
-
-    Client->>+Tomcat: HTTP GET /staff?lastName=Smith
-    Tomcat->>+DataREST: dispatch to StaffRepo handler
-    DataREST->>+StaffRepo: findByLastName("Smith")
-    Note right of StaffRepo: @Query JPQL - SELECT s FROM Staff s WHERE s.member.lastName = :lastName
-    StaffRepo->>+Hibernate: execute JPQL query
-    Hibernate->>+PG: SELECT s.* FROM staff s WHERE s.last_name = 'Smith'
-    PG-->>-Hibernate: ResultSet
-    Hibernate-->>-StaffRepo: List of Staff
-    StaffRepo-->>-DataREST: List of Staff
-    DataREST-->>-Tomcat: JSON array
-    Tomcat-->>-Client: 200 OK
-
-    Client->>+Tomcat: POST /courses/filter (credits=3, dept=CS)
-    Tomcat->>+DynSvc: filterBySpecification(CourseFilter)
-    Note right of DynSvc: Strategy 1 - JPA Specification lambda Predicate list
-    DynSvc->>+CourseRepo: findAll(Specification of Course)
-    CourseRepo->>+Hibernate: Criteria API dynamic WHERE clause
-    Hibernate->>+PG: SELECT c.* FROM course c WHERE c.credits=3 AND c.dept_id=?
-    PG-->>-Hibernate: ResultSet
-    Hibernate-->>-CourseRepo: List of Course
-    CourseRepo-->>-DynSvc: List of Course
-    DynSvc-->>-Tomcat: List of Course
-    Tomcat-->>-Client: 200 OK
-
-    Client->>+Tomcat: POST /courses/filter/querydsl (credits=3)
-    Tomcat->>+DynSvc: filterByQueryDsl(CourseFilter)
-    Note right of DynSvc: Strategy 2 - QueryDSL BooleanBuilder + QCourse APT codegen
-    DynSvc->>+QDSLRepo: findAll(BooleanBuilder predicate)
-    QDSLRepo->>+Hibernate: QueryDSL HQL to SQL translation
-    Hibernate->>+PG: SELECT c.* FROM course c WHERE c.credits = 3
-    PG-->>-Hibernate: ResultSet
-    Hibernate-->>-QDSLRepo: Iterable of Course
-    QDSLRepo-->>-DynSvc: List of Course
-    DynSvc-->>-Tomcat: List of Course
-    Tomcat-->>-Client: 200 OK
-
-    Client->>+Tomcat: POST /courses/filter/example (credits=3)
-    Tomcat->>+DynSvc: filterByExample(CourseFilter)
-    Note right of DynSvc: Strategy 3 - Query by Example - Example.of(Course probe)
-    DynSvc->>+CourseRepo: findAll(Example of Course)
-    CourseRepo->>+Hibernate: probe entity - ignore null fields
-    Hibernate->>+PG: SELECT c.* FROM course c WHERE c.credits = 3
-    PG-->>-Hibernate: ResultSet
-    Hibernate-->>-CourseRepo: List of Course
-    CourseRepo-->>-DynSvc: List of Course
-    DynSvc-->>-Tomcat: List of Course
-    Tomcat-->>-Client: 200 OK
-
-    Client->>+Tomcat: GET /students/oldest
-    Tomcat->>+UniSvc: findOldest() via service
-    UniSvc->>+StudentRepo: findOldest()
-    Note right of StudentRepo: @Query nativeQuery=true - SELECT * FROM student ORDER BY age DESC LIMIT 1
-    StudentRepo->>+Hibernate: native SQL passthrough
-    Hibernate->>+PG: SELECT * FROM student ORDER BY age DESC LIMIT 1
-    PG-->>-Hibernate: single row
-    Hibernate-->>-StudentRepo: Optional of Student
-    StudentRepo-->>-UniSvc: Optional of Student
-    UniSvc-->>-Tomcat: Student
-    Tomcat-->>-Client: 200 OK { id, attendee, age, fullTime }
-```
-
-### university — Layer Call Chain
-
-```
-HTTP Client
-    │ HTTP request (blocking thread assigned by Tomcat)
-    ▼
-Tomcat Thread Pool  (spring-boot-starter-web → auto-configures Tomcat)
-    │ DispatcherServlet routes to handler
-    ▼
-Spring Data REST HAL Controller  (@RepositoryRestResource on StaffRepo)
-  OR
-Service Layer  (UniversityService / DynamicQueryService)
-    │ calls repository method returning List<T> / Optional<T>
-    ▼
-Repository Layer  (StaffRepo / StudentRepo / CourseRepo / CourseQueryDslRepo)
-    │ Spring Data generates query (Derived / JPQL / Native / Spec / QueryDSL / QBE)
-    ▼
-Hibernate ORM  (JPA Provider — translates JPQL/HQL/Criteria → SQL)
-    │ JDBC connection from HikariCP pool
+Hibernate ORM  (JPA Provider — translates JPQL → SQL)
+    │ JDBC blocking call
     ▼
 PostgreSQL  (Docker Compose :5432)
-    │ SQL result rows returned
+    │ ResultSet
     ▼
-Hibernate maps rows → JPA entities → returned up the call stack → HTTP response
+List<Course>  serialised to JSON → 200 OK
 ```
 
 ---
 
-## Side-by-Side Comparison
+## Flow 2: Get Course by ID — 404 ProblemDetail
 
-| Step | `college` (Reactive) | `university` (Blocking) |
-|---|---|---|
-| **HTTP Server** | Netty event loop | Tomcat thread pool |
-| **Thread during I/O** | Event loop thread freed immediately | Tomcat thread blocked until DB responds |
-| **Return type** | `Mono<T>` / `Flux<T>` | `T` / `List<T>` / `Optional<T>` |
-| **Data access layer** | `ReactiveCrudRepository` | `JpaRepository` + extensions |
-| **Query translation** | Spring Data → MongoDB BSON query | Spring Data → JPQL/SQL via Hibernate |
-| **ORM / Driver** | Spring Data MongoDB Reactive Driver | Hibernate ORM + JDBC (HikariCP) |
-| **Database wire protocol** | MongoDB Binary Protocol (async) | PostgreSQL wire protocol (sync JDBC) |
-| **Backpressure** | Built-in via `Flux` publisher/subscriber | Not applicable (synchronous) |
-| **Streaming response** | Yes — `Flux` maps to SSE / chunked response | No — full result loaded into memory first |
-| **Concurrency upgrade path** | Already maximally concurrent | Add `spring.threads.virtual.enabled=true` |
+> **Feature:** Spring Boot 3.2+ `ProblemDetail` (RFC 7807).  
+> `CourseNotFoundException` is thrown by the controller, caught by `@RestControllerAdvice`, and serialised to a structured `application/problem+json` response.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client
+    participant CC as CourseController
+    participant CR as CourseRepo
+    participant HB as Hibernate ORM
+    participant PG as PostgreSQL
+    participant GEH as GlobalExceptionHandler
+
+    Note over Client,GEH: GET /api/courses/99 - course does not exist
+
+    Client->>+CC: GET /api/courses/99
+    CC->>+CR: findById(99)
+    CR->>+HB: SELECT * FROM course WHERE id = 99
+    HB->>+PG: SELECT c.* FROM course c WHERE c.id = 99
+    PG-->>-HB: empty result set
+    HB-->>-CR: Optional.empty()
+    CR-->>-CC: Optional.empty()
+    CC->>+GEH: throw CourseNotFoundException(99)
+    Note right of GEH: @RestControllerAdvice intercepts<br/>Builds ProblemDetail RFC-7807
+    GEH-->>-Client: 404 Not Found - application/problem+json
+    Note right of Client: JSON body contains type, title, status, detail, timestamp, path
+```
+
+### Flow 2 — ProblemDetail Response Shape
+
+```json
+HTTP/1.1 404 Not Found
+Content-Type: application/problem+json
+
+{
+  "type":      "https://api.university.example/errors/course-not-found",
+  "title":     "Course Not Found",
+  "status":    404,
+  "detail":    "Course with ID 99 was not found.",
+  "timestamp": "2026-03-03T10:30:00Z",
+  "path":      "/api/courses/99"
+}
+```
+
+### Flow 2 — Layer Call Chain
+
+```
+HTTP Client
+    │ GET /api/courses/99
+    ▼
+CourseController
+    │ courseRepo.findById(99).orElseThrow(() -> new CourseNotFoundException(99))
+    ▼
+CourseRepo → Hibernate → PostgreSQL
+    │ Optional.empty() returned
+    ▼
+CourseController throws CourseNotFoundException
+    ▼
+GlobalExceptionHandler  (@RestControllerAdvice intercepts)
+    │ ProblemDetail.forStatusAndDetail(404, msg)
+    ▼
+HTTP 404 application/problem+json → Client
+```
 
 ---
 
-> **See also:**
-> - [WEBFLUX_VS_VIRTUAL_THREADS.md](./WEBFLUX_VS_VIRTUAL_THREADS.md) — Deep dive: WebFlux vs Virtual Threads concurrency models
-> - [ARCHITECTURE_C4_LEVELS.md](./ARCHITECTURE_C4_LEVELS.md) — C4 Level 0/1/2 diagrams
-> - [ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md) — Full component-level diagram
-> - [REPOSITORY_SUMMARY.md](./REPOSITORY_SUMMARY.md) — Module overview and query strategy matrix
+## Flow 3: Dynamic Filter — JPA Specification
 
-*Generated on 2026-03-03 by GitHub Copilot — [LinkedInLearning/spring-data-3-5959699](https://github.com/LinkedInLearning/spring-data-3-5959699)*
+> **Feature:** `JpaSpecificationExecutor` + lambda `Specification` predicate.  
+> `DynamicQueryService.filterBySpecification()` builds a WHERE clause from a `CourseFilter` at runtime — only conditions with non-empty `Optional` values are added.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client
+    participant CC as CourseController
+    participant DQS as DynamicQueryService
+    participant CF as CourseFilter
+    participant CR as CourseRepo
+    participant HB as Hibernate ORM
+    participant PG as PostgreSQL
+
+    Note over Client,PG: GET /api/courses/filter?credits=3 - dynamic Specification query
+
+    Client->>+CC: GET /api/courses/filter?credits=3
+    CC->>+CF: CourseFilter.filterBy().credits(3)
+    Note right of CF: department = Optional.empty()<br/>credits     = Optional.of(3)<br/>instructor  = Optional.empty()
+    CF-->>-CC: CourseFilter instance
+    CC->>+DQS: filterBySpecification(filter)
+    Note right of DQS: Builds lambda Specification<br/>Only adds predicates where Optional is present
+    DQS->>+CR: findAll(Specification)
+    CR->>+HB: execute JPA Criteria query
+    HB->>+PG: SELECT * FROM course WHERE credits = 3
+    PG-->>-HB: ResultSet rows
+    HB-->>-CR: List of Course
+    CR-->>-DQS: List of Course
+    DQS-->>-CC: List of Course
+    CC-->>-Client: 200 OK - JSON filtered array
+```
+
+### Flow 3 — Specification Lambda (Simplified)
+
+```java
+courseRepo.findAll((root, query, cb) -> {
+    List<Predicate> predicates = new ArrayList<>();
+    filter.getCredits().ifPresent(c ->
+        predicates.add(cb.equal(root.get("credits"), c)));
+    return cb.and(predicates.toArray(new Predicate[0]));
+});
+// SQL: WHERE credits = 3
+```
+
+---
+
+## Flow 4: Dynamic Filter — QueryDSL
+
+> **Feature:** `QuerydslPredicateExecutor` + APT-generated `QCourse` Q-types.  
+> `DynamicQueryService.filterByQueryDsl()` uses type-safe `BooleanBuilder` — no string field names, full IDE auto-complete.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client
+    participant CC as CourseController
+    participant DQS as DynamicQueryService
+    participant QR as CourseQueryDslRepo
+    participant HB as Hibernate ORM
+    participant PG as PostgreSQL
+
+    Note over Client,PG: GET /api/courses/querydsl?credits=3 - QueryDSL query
+
+    Client->>+CC: GET /api/courses/querydsl?credits=3
+    CC->>+DQS: filterByQueryDsl(filter)
+    Note right of DQS: Builds BooleanBuilder<br/>QCourse.course.credits.eq(3)<br/>No string field names - type safe
+    DQS->>+QR: findAll(Predicate)
+    QR->>+HB: execute QueryDSL predicate
+    HB->>+PG: SELECT * FROM course WHERE credits = 3
+    PG-->>-HB: ResultSet rows
+    HB-->>-QR: Iterable of Course
+    QR-->>-DQS: Iterable of Course
+    DQS-->>-CC: List of Course
+    CC-->>-Client: 200 OK - JSON filtered array
+```
+
+### Flow 3 vs Flow 4 — Strategy Comparison
+
+| Attribute | JPA Specification (Flow 3) | QueryDSL (Flow 4) |
+|---|---|---|
+| **Type safety** | Field names as strings — typos cause runtime errors | APT-generated `QCourse` — typos caught at compile time |
+| **IDE support** | No auto-complete for field names | Full auto-complete on `QCourse.course.*` |
+| **Compose predicates** | `criteriaBuilder.and(list)` | `BooleanBuilder.and(predicate)` |
+| **Null handling** | Manual `ifPresent` pattern | Manual `BooleanBuilder` conditions |
+| **Setup cost** | None — built into Spring Data JPA | Requires QueryDSL APT plugin + compile step |
+| **Best for** | Simple to moderate dynamic queries | Complex, large-scale dynamic query construction |
+
+---
+
+## Flow 5: SequencedCollection — Reversed Courses
+
+> **Feature:** Java 21 `SequencedCollection.reversed()`.  
+> `findCoursesReversed()` returns courses in last-to-first order without mutating the original list — a non-destructive reversed view.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as HTTP Client
+    participant CC as CourseController
+    participant US as UniversityService
+    participant CR as CourseRepo
+    participant PG as PostgreSQL
+
+    Note over Client,PG: GET /api/courses/reversed - Java 21 SequencedCollection
+
+    Client->>+CC: GET /api/courses/reversed
+    CC->>+US: findCoursesReversed()
+    US->>+CR: findAll()
+    CR->>+PG: SELECT * FROM course ORDER BY id ASC
+    PG-->>-CR: ResultSet rows (ascending)
+    CR-->>-US: List of Course (ascending)
+    Note right of US: Java 21 - list.reversed()<br/>Returns reversed VIEW<br/>Does NOT mutate original list
+    US-->>-CC: SequencedCollection of Course (descending)
+    CC-->>-Client: 200 OK - JSON array reversed order
+```
+
+### Java 21 SequencedCollection API Quick Reference
+
+| Old API (pre-Java 21) | New API (Java 21) | Behaviour |
+|---|---|---|
+| `list.get(0)` | `list.getFirst()` | First element |
+| `list.get(list.size() - 1)` | `list.getLast()` | Last element |
+| `Collections.reverse(list)` — mutates | `list.reversed()` — non-destructive | Reversed view |
+| No equivalent | `list.addFirst(e)` / `list.addLast(e)` | Add to ends |
+
+---
+
+*Generated 2026-03-03 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.2+)*
