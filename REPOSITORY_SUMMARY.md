@@ -11,11 +11,14 @@
 | **Spring Boot** | 3.3.5 | 3.3.5 |
 | **Java** | 21 | 21 |
 | **Persistence** | MongoDB (Reactive) | PostgreSQL / H2 (JPA) |
-| **Web Stack** | WebFlux (non-blocking, reactive) | Spring MVC (blocking, servlet) |
+| **Web Stack** | [WebFlux (non-blocking, reactive)](./WEBFLUX_VS_VIRTUAL_THREADS.md) | Spring MVC (blocking, servlet) |
 | **API Exposure** | SpringDoc OpenAPI 2.5.0 (WebFlux UI) | SpringDoc OpenAPI 2.5.0 (MVC UI) + Spring Data REST |
 | **Build** | Maven + `spring-boot-maven-plugin` | Maven + QueryDSL APT codegen |
 | **Local Dev** | `spring-boot-docker-compose` (auto-starts Mongo) | `docker-compose.yml` + `postgres/schema.sql` |
 | **Test DB** | — (no tests) | H2 in-memory |
+
+> **Why WebFlux for `college`?** The `college` module uses Spring WebFlux + Project Reactor to demonstrate non-blocking, reactive data access with MongoDB.  
+> For a deep-dive comparison of **WebFlux vs Java 21 Virtual Threads** — including concurrency model, backpressure, programming model complexity, and when to choose each — see [WEBFLUX_VS_VIRTUAL_THREADS.md](./WEBFLUX_VS_VIRTUAL_THREADS.md).
 
 ---
 
@@ -99,6 +102,16 @@
 | **Stray `@Repository` import** | `UniversityService` imports `@Repository` annotation (unused) — minor code smell | Low |
 | **Native queries with `LIMIT`** | Non-portable; Spring Data's `Pageable` or `Top`/`First` derived syntax is preferred | Low |
 | **Branch structure** | Branch `06_03e` naming convention (`chapter_lesson`) confirms this is a LinkedIn Learning course progression repo | Info |
+
+---
+
+## See Also
+
+| Document | Description |
+|---|---|
+| [WEBFLUX_VS_VIRTUAL_THREADS.md](./WEBFLUX_VS_VIRTUAL_THREADS.md) | Principal Architect comparison: WebFlux (used in `college`) vs Java 21 Virtual Threads — concurrency models, backpressure, programming model, decision matrix |
+| [ARCHITECTURE_C4_LEVELS.md](./ARCHITECTURE_C4_LEVELS.md) | C4 Level 0 (Context), Level 1 (Container), Level 2 (Component) diagrams with full cross-level traceability |
+| [ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md) | Full component-level architecture diagram with query strategy flowchart |
 
 ---
 
