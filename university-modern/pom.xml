@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      Spring Boot Parent: gives us sensible defaults for everything.
+      Think of it like the rulebook — versions, plugins, and settings are
+      all inherited so we don't have to repeat them everywhere.
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.3.5</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>university-modern</artifactId>
+    <version>1.0.0</version>
+    <name>university-modern</name>
+    <description>
+        University Modern — demonstrates Java 17 Records, Sealed Classes, Text Blocks,
+        Pattern Matching; Java 21 Virtual Threads and Sequenced Collections;
+        Spring Boot 3.2+ RestClient and ProblemDetail RFC-7807 error responses.
+    </description>
+
+    <properties>
+        <!-- Java 21 required for Virtual Threads and Sequenced Collections -->
+        <java.version>21</java.version>
+        <!-- QueryDSL generates Q-classes (e.g. QCourse) so we can write type-safe queries -->
+        <querydsl.version>5.0.0</querydsl.version>
+    </properties>
+
+    <dependencies>
+
+        <!--
+          Spring MVC Web Starter
+          Starts an embedded Tomcat server so our app can receive HTTP requests.
+          Also provides RestClient (Spring Boot 3.2+) for calling other services.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!--
+          Spring Data JPA
+          Handles all the boring database boilerplate — connections, transactions,
+          and turning Java objects into database rows automatically.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!--
+          Spring Data REST
+          Automatically creates REST API endpoints for every repository.
+          Hit /courses and you get a list of courses — no controller needed!
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-rest</artifactId>
+        </dependency>
+
+        <!--
+          PostgreSQL Driver
+          The "translator" Java uses to talk to a PostgreSQL database.
+          Scope=runtime means it is only needed when the app actually runs.
+        -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          H2 In-Memory Database (tests only)
+          A tiny database that lives entirely in memory — perfect for tests
+          because it starts fast, needs no setup, and disappears when the test ends.
+        -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+          QueryDSL JPA — Type-safe query DSL for JPA
+          Instead of writing fragile string queries like "WHERE credits = 3",
+          QueryDSL lets you write Java code: QCourse.course.credits.eq(3).
+          Uses the 'jakarta' classifier for Jakarta EE 9+ compatibility.
+        -->
+        <dependency>
+            <groupId>com.querydsl</groupId>
+            <artifactId>querydsl-jpa</artifactId>
+            <version>${querydsl.version}</version>
+            <classifier>jakarta</classifier>
+        </dependency>
+
+        <!--
+          QueryDSL APT — Annotation Processing Tool
+          Runs at compile time and reads our @Entity classes to generate
+          the Q-classes (QCourse, QStaff, etc.) automatically.
+          Scope=provided means it is only needed during compilation.
+        -->
+        <dependency>
+            <groupId>com.querydsl</groupId>
+            <artifactId>querydsl-apt</artifactId>
+            <version>${querydsl.version}</version>
+            <classifier>jakarta</classifier>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          SpringDoc OpenAPI (Swagger UI)
+          Reads our controllers and auto-generates interactive API documentation.
+          Visit http://localhost:8080/swagger-ui.html to try all endpoints live.
+        -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>2.5.0</version>
+        </dependency>
+
+        <!--
+          Spring Boot Test
+          Bundles JUnit 5, Mockito, and Spring's test utilities.
+          Everything you need to write and run unit/integration tests.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+
+            <!--
+              Spring Boot Maven Plugin
+              Packages the entire application (code + dependencies) into a single
+              executable JAR file. Run it with: java -jar university-modern.jar
+            -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!--
+              Maven Compiler Plugin — configured for Java 21 + QueryDSL APT
+              The annotationProcessorPaths tells javac to also run QueryDSL's
+              code generator, producing Q-classes alongside compiled .class files.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <!-- Generates QCourse, QStaff, QDepartment, etc. -->
+                        <path>
+                            <groupId>com.querydsl</groupId>
+                            <artifactId>querydsl-apt</artifactId>
+                            <version>${querydsl.version}</version>
+                            <classifier>jakarta</classifier>
+                        </path>
+                        <!-- JPA API needed by the QueryDSL APT processor -->
+                        <path>
+                            <groupId>jakarta.persistence</groupId>
+                            <artifactId>jakarta.persistence-api</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+        </plugins>
+    </build>
+
+</project>

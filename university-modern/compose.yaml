@@ -1,0 +1,74 @@
+# =============================================================================
+# Docker Compose — Starts the full University Modern stack with one command:
+#   docker compose up
+#
+# Services:
+#   db  — PostgreSQL 16 database (starts first)
+#   app — Spring Boot application (waits for db to be ready, then starts)
+# =============================================================================
+
+services:
+
+  # --------------------------------------------------------------------------
+  # db: PostgreSQL database
+  # Stores all our university data: staff, students, courses, departments.
+  # --------------------------------------------------------------------------
+  db:
+    image: postgres:16
+    container_name: university-db
+
+    # Environment variables tell PostgreSQL what user/password/database to create
+    # on first startup.  These match the values in application.properties.
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: catalog
+
+    # Expose port 5432 on the host so you can connect with any Postgres tool
+    # (e.g. pgAdmin or DBeaver) at localhost:5432.
+    ports:
+      - "5432:5432"
+
+    # Mount our schema.sql into the Postgres "init" folder.
+    # Postgres automatically runs all .sql files in this folder on first startup.
+    volumes:
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+    # Health check: ask Postgres every 10 seconds if it's ready.
+    # The app service will wait until this check passes before starting.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d catalog"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # app: Spring Boot University Modern application
+  # Built from the Dockerfile in this directory.
+  # --------------------------------------------------------------------------
+  app:
+    build: .
+    container_name: university-app
+
+    # Map host port 8080 → container port 8080.
+    # Open http://localhost:8080/swagger-ui.html after startup.
+    ports:
+      - "8080:8080"
+
+    # Override Spring Boot properties via environment variables.
+    # Docker Compose automatically converts SPRING_DATASOURCE_URL
+    # to the property spring.datasource.url.
+    environment:
+      # Point to the 'db' service by its service name — Docker DNS resolves it.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/catalog
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: pass
+      # Java 21 Virtual Threads: each HTTP request runs on a virtual thread.
+      # Virtual threads are managed by the JVM (not the OS), letting us handle
+      # thousands of concurrent requests without needing thousands of OS threads.
+      SPRING_THREADS_VIRTUAL_ENABLED: "true"
+
+    # Don't start the app until the database health check passes.
+    depends_on:
+      db:
+        condition: service_healthy
