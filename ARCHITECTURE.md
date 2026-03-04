@@ -382,16 +382,411 @@ flowchart LR
 | `DynamicQueryService` | `filterByExample(CourseFilter)` | `List<Course>` | Spring Data `Example.of(probe)` — null fields excluded automatically |
 | `DynamicQueryService` | `describeFilter(Object)` | `String` | **Java 17** `instanceof` pattern matching — `if (filterObject instanceof CourseFilter cf)` |
 
-#### 4.2c — Query Strategy Comparison
+#### 4.2c — Query Strategy Comparison, Recommendations & Best Practices
 
-| Attribute | Specification (Strategy 1) | QueryDSL (Strategy 2) | QBE (Strategy 3) |
-|---|---|---|---|
-| **Type safety** | Field names as Strings — typos caught at runtime | Compile-time `QCourse` Q-types — typos caught at compile time | Java object fields — refactoring-safe |
-| **Null / absent handling** | `Optional.ifPresent()` per predicate | Manual `BooleanBuilder.and()` conditions | Probe object — null fields are automatically excluded |
-| **Predicate composition** | `criteriaBuilder.and(array)` | `BooleanBuilder.and(pred)` — chainable | Single `Example.of(probe)` — not composable |
-| **IDE auto-complete** | No — String field names | Full — `QCourse.course.credits.eq(3)` | Partial — uses entity class fields |
-| **Setup cost** | Zero — built into `JpaSpecificationExecutor` | Requires QueryDSL APT Maven plugin + compile step | Zero — built into `JpaRepository` |
-| **Best for** | Simple to moderate dynamic WHERE clauses | Complex, large-scale, enterprise-grade dynamic filtering | Exact-match lookups on entity fields |
+> **Principal Architect Note:**  
+> Spring Data offers five distinct query mechanisms. No single strategy is universally best — the right choice depends on query complexity, compile-time safety requirements, runtime dynamism, team skill level, and cloud portability constraints. This section provides a complete decision framework at the principal engineer level.
+
+---
+
+##### Strategy Overview
+
+Spring Data JPA ships five strategies that sit on a spectrum from "zero code" to "full programmatic control":
+
+```
+SIMPLICITY ◄─────────────────────────────────────────────────► CONTROL & FLEXIBILITY
+     │                                                               │
+  Derived       @Query       @Query            QBE           JPA Criteria
+  Methods       (JPQL)    (nativeQuery)   (Probe+Matcher)    / QueryDSL
+     │              │           │               │               │
+  auto-gen     co-located    raw SQL        null-equals      type-safe
+  from name    string SQL    max perf       dynamic form     compile-safe
+```
+
+---
+
+##### Master Comparison Table
+
+| Attribute | 1 · Derived Methods | 2 · @Query JPQL | 3 · Native Query | 4 · Query by Example | 5 · JPA Criteria / QueryDSL |
+|---|---|---|---|---|---|
+| **Type safety** | Method signature is type-safe; field names encoded in method string — refactor misses caught at test time | Strings — JPQL syntax errors caught at runtime startup | Strings — SQL errors caught at runtime startup | Java object — null fields excluded automatically; refactor-safe | **Fully compile-time** — QueryDSL `QCourse.course.credits.eq(3)`; Criteria `root.get("credits")` is String but wrapped |
+| **Runtime dynamism** | None — fixed WHERE every call | None — fixed query every call | None — fixed SQL every call | **High** — any field may be null (skipped) | **Maximum** — predicates added/omitted per request |
+| **Query complexity** | Simple single-table conditions only | Moderate — joins, subselects, GROUP BY, ORDER BY | **Maximum** — any SQL including CTEs, window functions, LATERAL joins | Equality and `LIKE` only — no `>`, `<`, joins, subqueries | **Maximum** — any condition expressible in JPA |
+| **Null/absent handling** | Method must be overloaded or use `Optional` | Manual `WHERE (:p IS NULL OR col = :p)` pattern | Manual SQL null checks | **Automatic** — null probe fields are ignored | `Optional.ifPresent()` guard per predicate; explicit |
+| **Predicate composition** | Not composable — one method per case | Not composable | Not composable | Single `Example.of(probe)` — AND only, no OR | Fully composable — `and()`, `or()`, `not()`, nested groups |
+| **IDE auto-complete / refactoring** | Partial — method naming conventions in IDE | No — SQL in a string | No — SQL in a string | Full — works with entity class fields | **Full** — QueryDSL Q-types generated at compile time |
+| **Cross-DB portability** | ✅ Full — JPQL generated per dialect | ✅ Full — JPQL | ❌ None — raw SQL may differ across PostgreSQL / MySQL / Oracle | ✅ Full | ✅ Full — Criteria API; QueryDSL also dialect-independent |
+| **Setup cost** | None — zero config | None | None | None — built into `JpaRepository` | Criteria: zero. QueryDSL: APT Maven plugin + compile step for Q-types |
+| **Testing ease** | Easy to unit-test return type | Medium — integration test to verify JPQL | Hard — DB-specific SQL; Testcontainers required | Easy | Medium — Specification can be isolated; QueryDSL predicates are pure Java |
+| **Named parameters** | Via `@Param` if needed | `@Param("name")` on method args | `@Param("name")` | N/A | Programmatic — no param binding |
+| **Pagination support** | ✅ `findAll(Pageable)` | ✅ `Page<T> findBy...(Pageable)` | ✅ with `countQuery` | ✅ `findAll(Example, Pageable)` | ✅ `findAll(Spec, Pageable)` |
+| **Principal recommendation** | ✅ Default for simple reads | ✅ Co-located moderate queries | ⚠️ Last resort — justify in ADR | ✅ Search forms / prototyping | ✅ **Production standard for dynamic APIs** |
+
+---
+
+##### Decision Flowchart
+
+```mermaid
+flowchart TD
+    START(["Query Requirement"])
+
+    START --> Q1{"Runtime dynamic?\nCriteria unknown\nat compile time?"}
+
+    Q1 -->|No — fixed criteria| Q2{"Complexity?"}
+    Q1 -->|Yes — dynamic| Q5{"Multiple optional\nequality fields only?"}
+
+    Q2 -->|"Simple\n1–2 fields"| A["✅ Derived Method\nfindByCreditsAndDepartment()"]
+    Q2 -->|"Moderate\njoins / projections"| B["✅ @Query JPQL\nText Block (Java 17)"]
+    Q2 -->|"DB-specific\nperformance critical\nCTE / window fn"| C["⚠️ Native Query\nnativeQuery=true\nDocument portability risk in ADR"]
+
+    Q5 -->|Yes — equality only\nno >, <, joins| D["✅ Query by Example\nExampleMatcher probe"]
+    Q5 -->|No — complex\nmixed conditions| Q6{"Team familiar\nwith QueryDSL?"}
+
+    Q6 -->|Yes| E["✅ QueryDSL\nBooleanBuilder + QCourse\nFull compile-time safety"]
+    Q6 -->|No / new team| F["✅ JPA Specification\nlambda predicate\nZero setup cost"]
+
+    A:::good
+    B:::good
+    C:::warn
+    D:::good
+    E:::good
+    F:::good
+
+    classDef good fill:#d4edda,stroke:#28a745,color:#000
+    classDef warn fill:#fff3cd,stroke:#ffc107,color:#000
+```
+
+---
+
+##### Strategy 1 — Derived Methods (Finder Methods)
+
+**When to use:** Read operations with 1–3 fixed conditions known at compile time. The standard starting point for any new repository — zero code, zero SQL.
+
+```java
+// CourseRepo.java — illustrative examples from university-modern
+// Spring Data generates the SQL automatically from the method name
+
+// Single condition
+Optional<Course> findByName(String name);
+
+// Multiple conditions — AND
+List<Course> findByCreditsAndDepartment(int credits, Department dept);
+
+// Comparison + ordering
+List<Course> findByCreditsGreaterThanOrderByNameAsc(int minCredits);
+
+// Navigating relationships (joins generated automatically)
+// "find courses whose department's chair's member's last name = ?"
+List<Course> findByDepartmentChairMemberLastName(String chairLastName);
+
+// Paginated result — LIMIT/OFFSET generated automatically
+Page<Course> findByCredits(int credits, Pageable pageable);
+```
+
+**Principal best practices:**
+- Keep method names short. If the name exceeds ~4 conditions, switch to `@Query`.
+- Always add `Optional<T>` return type for single-result finders — avoids `EmptyResultDataAccessException`.
+- Use `findBy` (returns null-safe) not `getBy` (throws exception on not-found) for predictable error handling upstream.
+- Prefer `findByDepartment(Department dept)` over `findByDepartmentId(int id)` to keep joins at the JPA level, not the caller's level.
+
+**Anti-patterns:**
+```java
+// ❌ BAD — method name encodes business logic; 7-part chain is unmaintainable
+List<Course> findByDepartmentChairMemberFirstNameAndDepartmentChairMemberLastNameAndCreditsGreaterThan(...);
+// ✅ GOOD — use @Query JPQL once method name exceeds 3–4 navigated fields
+```
+
+---
+
+##### Strategy 2 — @Query JPQL / HQL
+
+**When to use:** Fixed queries of moderate complexity — joins, projections, aggregates, subqueries — that method naming cannot express cleanly. The standard for all non-trivial fixed SQL in enterprise codebases.
+
+```java
+// StaffRepo.java — Java 17 Text Block makes multi-line JPQL readable
+// Text blocks (""") eliminate string concatenation and escape hell
+
+@Query("""
+        SELECT s
+        FROM   Staff s
+        WHERE  s.member.lastName = :lastName
+        ORDER  BY s.member.firstName ASC
+        """)
+List<Staff> findByMemberLastName(String lastName);
+
+// CourseRepo.java — JPQL with named parameter, projection join
+@Query("""
+        SELECT c
+        FROM   Course c
+        WHERE  c.credits = :credits
+        ORDER  BY c.name ASC
+        """)
+List<Course> findByCredits(@Param("credits") int credits);
+
+// Aggregate — count courses per department (JPQL DTO constructor expression)
+@Query("""
+        SELECT new com.example.university.web.DeptCourseCount(
+                   d.name, COUNT(c))
+        FROM   Department d
+        LEFT   JOIN d.courses c
+        GROUP  BY d.name
+        ORDER  BY COUNT(c) DESC
+        """)
+List<DeptCourseCount> countCoursesPerDepartment();
+```
+
+**Principal best practices:**
+- Always use **Java 17 text blocks** (`"""`) for multi-line JPQL — single-line strings are unreadable and error-prone.
+- Prefer **named parameters** (`：name`) over positional (`?1`) — named params survive method signature reordering.
+- Add `@Modifying @Transactional` for UPDATE/DELETE `@Query` methods — Spring Data requires both annotations.
+- Validate JPQL queries in integration tests (H2 `MODE=PostgreSQL` + Testcontainers) — string queries fail silently until runtime if untested.
+- For projections, prefer interface-based projections (`ShowChair`) or DTO record constructors over raw `Object[]` — type safety is preserved.
+
+**Anti-patterns:**
+```java
+// ❌ BAD — string concatenation, SQL injection risk, unreadable
+@Query("SELECT c FROM Course c WHERE c.name LIKE '%" + name + "%'")
+
+// ❌ BAD — positional params break when signature changes
+@Query("SELECT s FROM Staff s WHERE s.member.lastName = ?1 AND s.member.firstName = ?2")
+
+// ✅ GOOD — named params + text block
+@Query("""
+        SELECT s FROM Staff s
+        WHERE  s.member.lastName  = :lastName
+          AND  s.member.firstName = :firstName
+        """)
+Optional<Staff> findByFullName(@Param("firstName") String fn, @Param("lastName") String ln);
+```
+
+---
+
+##### Strategy 3 — Native Queries (`nativeQuery = true`)
+
+**When to use:** Last resort. Justify in an Architecture Decision Record (ADR). Valid use cases: database-specific window functions, CTEs, `EXPLAIN`-proven performance bottlenecks, PostgreSQL `JSONB` operators, or `COPY` bulk operations.
+
+```java
+// ⚠️ Portability warning: SQL below is PostgreSQL-specific
+
+// Use case: PostgreSQL window function — no JPQL equivalent
+@Query(
+    value = """
+            SELECT c.name,
+                   c.credits,
+                   RANK() OVER (PARTITION BY c.department_id ORDER BY c.credits DESC) AS rank
+            FROM   course c
+            WHERE  c.department_id = :deptId
+            """,
+    nativeQuery = true
+)
+List<Object[]> findCourseRankingByDepartment(@Param("deptId") int deptId);
+
+// Use case: PostgreSQL full-text search
+@Query(
+    value = "SELECT * FROM course WHERE to_tsvector('english', name) @@ plainto_tsquery('english', :term)",
+    nativeQuery = true
+)
+List<Course> fullTextSearch(@Param("term") String term);
+```
+
+**Principal best practices:**
+- **Always document the ADR reason** — add a comment in the repository interface explaining why native SQL was chosen.
+- **Abstract results behind a projection interface** — never return `List<Object[]>` to the service layer; map to a typed record or interface projection.
+- **Test with Testcontainers** (`RealPostgresIT`) — H2 will not execute PostgreSQL-specific syntax; native queries must be verified against the exact production DB engine.
+- **Extract to a `@NamedNativeQuery` on the entity** for reuse across multiple repositories.
+- Consider wrapping complex native queries in a **database VIEW** and mapping a read-only `@Entity` to it — this keeps the Java code clean while keeping complex SQL in the DB where it belongs.
+
+**Anti-patterns:**
+```java
+// ❌ BAD — no portability rationale, no ADR, no comment
+@Query(value = "SELECT * FROM course WHERE name ILIKE :n", nativeQuery = true)
+// ✅ PREFER — JPQL LOWER() works everywhere; nativeQuery not needed here
+@Query("SELECT c FROM Course c WHERE LOWER(c.name) LIKE LOWER(CONCAT('%', :n, '%'))")
+
+// ❌ BAD — raw Object[] leaks to service layer
+List<Object[]> findRaw();
+// ✅ GOOD — map to record projection
+interface CourseRankView { String getName(); int getCredits(); int getRank(); }
+List<CourseRankView> findCourseRankingByDepartment(@Param("deptId") int deptId);
+```
+
+---
+
+##### Strategy 4 — Query by Example (QBE)
+
+**When to use:** Search forms where any combination of equality fields may be present. Excellent for admin UIs and rapid prototyping. Graduate to Specification or QueryDSL if you need range queries (`>`, `<`), `OR` conditions, or joins.
+
+```java
+// DynamicQueryService.java — QBE in university-modern
+public List<Course> filterByExample(CourseFilter filter) {
+    // Build a "probe" — a Course object with only the fields you want to match.
+    // Fields left null are automatically EXCLUDED from the WHERE clause.
+    Course probe = new Course();
+    filter.getCredits().ifPresent(probe::setCredits);
+    filter.getDepartment().ifPresent(probe::setDepartment);
+
+    // ExampleMatcher — controls matching rules:
+    //   withIgnoreCase()          → LOWER(name) = LOWER(:probe)
+    //   withStringMatcher(CONTAINING) → LIKE '%probe%'
+    //   withIgnoreNullValues()    → null fields are not added to WHERE
+    ExampleMatcher matcher = ExampleMatcher.matching()
+            .withIgnoreCase()
+            .withIgnoreNullValues()
+            .withStringMatcher(ExampleMatcher.StringMatcher.CONTAINING);
+
+    return courseRepo.findAll(Example.of(probe, matcher));
+}
+```
+
+**Principal best practices:**
+- **Prefer QBE for forms with 4+ optional equality filters** — it eliminates the if/null guard pattern entirely.
+- Always use `ExampleMatcher.withIgnoreNullValues()` — the default behaviour includes null fields as `IS NULL`, which almost never matches what you want.
+- For string fields, use `StringMatcher.CONTAINING` instead of `StringMatcher.EXACT` to enable partial matches.
+- **QBE ceiling:** The moment you need `age > 18` or `OR name = 'x' OR name = 'y'`, switch to **Specification** — QBE cannot express these conditions.
+
+**Anti-patterns:**
+```java
+// ❌ BAD — no ExampleMatcher, null fields generate IS NULL predicates
+courseRepo.findAll(Example.of(probe));
+
+// ❌ BAD — using QBE for a range query that it cannot express
+// QBE has no API for greater-than — it silently falls back to equality
+// Use JpaSpecificationExecutor instead
+```
+
+---
+
+##### Strategy 5 — JPA Criteria API / QueryDSL
+
+**When to use:** Production standard for any API with dynamic query parameters (search endpoints, filter panels, report builders). The only strategies that guarantee both **compile-time type safety** and **full runtime dynamism**.
+
+**JPA Criteria API — Specification pattern (university-modern `filterBySpecification`):**
+
+```java
+// DynamicQueryService.java — Specification with Optional.ifPresent guards
+// Each predicate is only added to the WHERE clause if the filter has a value.
+
+public List<Course> filterBySpecification(CourseFilter filter) {
+    return courseRepo.findAll((root, query, cb) -> {
+        List<Predicate> predicates = new ArrayList<>();
+
+        // Equality predicates — added only if filter field is present
+        filter.getDepartment().ifPresent(d ->
+                predicates.add(cb.equal(root.get("department"), d)));
+        filter.getCredits().ifPresent(c ->
+                predicates.add(cb.equal(root.get("credits"), c)));
+        filter.getInstructor().ifPresent(i ->
+                predicates.add(cb.equal(root.get("instructor"), i)));
+
+        // case-insensitive LIKE — added only if nameLike is present
+        filter.getNameLike().ifPresent(n ->
+                predicates.add(cb.like(
+                        cb.lower(root.get("name")),
+                        "%" + n.toLowerCase() + "%")));
+
+        // Combine all active predicates with AND
+        return cb.and(predicates.toArray(new Predicate[0]));
+    });
+}
+```
+
+**QueryDSL — type-safe predicate builder (university-modern `filterByQueryDsl`):**
+
+```java
+// DynamicQueryService.java — QueryDSL with QCourse APT-generated type
+// QCourse.course.credits is a NumberPath<Integer> — eq(), gt(), lt() all type-checked
+
+public List<Course> filterByQueryDsl(CourseFilter filter) {
+    QCourse q = QCourse.course;
+    BooleanBuilder pred = new BooleanBuilder();
+
+    // Each predicate uses strongly typed field references — typos caught at compile time
+    filter.getDepartment().ifPresent(d -> pred.and(q.department.eq(d)));
+    filter.getCredits().ifPresent(c   -> pred.and(q.credits.eq(c)));
+    filter.getInstructor().ifPresent(i -> pred.and(q.instructor.eq(i)));
+    // Range query — only possible with QueryDSL / Criteria, not QBE or Derived
+    // filter.getMinCredits().ifPresent(min -> pred.and(q.credits.goe(min)));
+
+    List<Course> results = new ArrayList<>();
+    queryDslRepo.findAll(pred).forEach(results::add);
+    return results;
+}
+```
+
+**Principal best practices — Specification:**
+- **Extract reusable predicates to a `CourseSpecifications` utility class** — each static method returns a `Specification<Course>`. The controller composes them with `.and()` / `.or()`.
+- Use `root.join("department", JoinType.LEFT)` for optional relationship joins — `INNER JOIN` silently drops rows with null FK.
+- Wrap `Specification.where(null)` as the base — `null` is identity for `and()` chains; safer than starting with an empty predicate.
+
+**Principal best practices — QueryDSL:**
+- **Always generate Q-types from a clean Maven build** — stale Q-types after entity renames cause silent compile failures.
+- Use `JPAQueryFactory` for multi-table joins and projections that Specification cannot easily express:
+
+```java
+// Advanced QueryDSL — multi-join projection into a DTO record
+@Bean
+JPAQueryFactory jpaQueryFactory(EntityManager em) { return new JPAQueryFactory(em); }
+
+// In service: joining Course → Department → Staff in one typed query
+List<CourseSummary> query = jpaQueryFactory
+        .select(Projections.constructor(CourseSummary.class,
+                QCourse.course.name,
+                QCourse.course.credits,
+                QDepartment.department.name))
+        .from(QCourse.course)
+        .innerJoin(QCourse.course.department, QDepartment.department)
+        .where(QCourse.course.credits.goe(3))
+        .orderBy(QCourse.course.name.asc())
+        .fetch();
+```
+
+---
+
+##### Principal Recommendation Matrix
+
+| Scenario | Recommended Strategy | Rationale |
+|---|---|---|
+| Simple CRUD — `findById`, `findAll`, single-condition reads | **Derived Methods** | Zero code; no maintenance cost; readable by any developer |
+| Fixed query with joins, GROUP BY, or subselects | **@Query JPQL + Text Block** | Co-located, readable, JPQL is portable across all SQL databases |
+| Admin search form with 3–8 optional equality filters | **Query by Example** | Null-equals eliminates if/null boilerplate; ExampleMatcher is expressive |
+| REST API filter endpoint (`/api/courses/filter?name=&credits=`) | **JPA Specification** | Zero setup, composable predicates, Pageable support; standard enterprise pattern |
+| Enterprise dynamic query with range predicates, OR logic, complex joins | **QueryDSL** | Full compile-time type safety; APT cost worth it at >= 3 dynamic joins |
+| PostgreSQL-specific feature (window function, full-text, JSONB) | **Native Query** | Last resort; must justify in ADR; must test with Testcontainers |
+| Read-only reporting / lightweight projection (no full entity needed) | **@Query + interface projection** | Avoids loading entire entity graph; reduces SELECT n+1 risk |
+| Multi-tenant SaaS — dynamic tenant WHERE clause on every query | **Specification + Filter bean** | `@Bean TenantFilter` injected automatically into all query Specifications |
+
+---
+
+##### Cross-Cutting Best Practices (All Strategies)
+
+1. **Always test with the real engine.** H2 `MODE=PostgreSQL` is not PostgreSQL. `RealPostgresIT` (Testcontainers `postgres:16`) catches dialect-specific differences before cloud deployment.
+
+2. **Select only what you need.** Use **projections** (`ShowChair`, DTO records) instead of fetching full entity graphs for read-heavy list endpoints. This can reduce payload size 10–50× on wide entities.
+
+3. **Avoid N+1 queries.** In JPQL, use `JOIN FETCH` for eagerly needed associations. In QueryDSL, use `.fetchJoin()`. Monitor with Hibernate's `spring.jpa.show-sql=true` during development.
+
+4. **Add `@Transactional(readOnly = true)` to ALL read service methods.** This tells Hibernate to skip dirty-checking, skips the flush before query execution, and allows the connection pool (`HikariCP`) to route reads to read replicas on AWS Aurora, Azure Flexible Server read replicas, or GCP AlloyDB read pools.
+
+5. **Paginate every collection endpoint.** `Pageable` support is built into all five strategies. Never return unbounded `List<T>` from a production API — one large department could return tens of thousands of courses.
+
+6. **Cloud portability: avoid native queries where possible.** AWS RDS PostgreSQL, Azure Flexible Server, and GCP Cloud SQL all run PostgreSQL — JPQL queries are portable across all three. Native queries lock you to PostgreSQL syntax but gain access to PostgreSQL-specific optimisations when needed.
+
+7. **Log slow queries, not all queries.** In production, configure `spring.jpa.show-sql=false` and use `logging.level.org.hibernate.SQL=DEBUG` only in local/dev profiles. Use `spring.jpa.properties.hibernate.generate_statistics=true` + Actuator `/actuator/metrics` in staging to surface slow queries.
+
+---
+
+##### Performance Impact Summary
+
+```
+Query Strategy   │  Parse Time  │  Type Check  │  Runtime Safety  │  ORM Overhead
+─────────────────┼──────────────┼──────────────┼──────────────────┼───────────────
+Derived Method   │  Startup     │  Partial     │  ✅ High         │  Low
+@Query JPQL      │  Startup     │  None        │  ⚠️  Medium      │  Low
+Native Query     │  Runtime     │  None        │  ❌ Low (SQL err) │  None (raw)
+QBE              │  Runtime     │  Type-safe   │  ✅ High         │  Low
+Criteria (Spec)  │  Runtime     │  Partial     │  ✅ High         │  Low
+QueryDSL         │  Compile ✅  │  Full ✅     │  ✅ Highest      │  Low
+```
 
 #### 4.2d — Java 21 Sealed Switch (live code)
 
