@@ -144,7 +144,98 @@ flowchart LR
 
 > End-to-end layer breakdown of `university-modern`.  
 > Each section follows: **Role & Design Decisions** → **Mermaid component diagram** → **Detailed tables** → **Code / comparison reference**.  
-> Ordered top-to-bottom to trace a request from the HTTP boundary down to the database and back.
+> Ordered top-to-bottom: **Bootstrap → Web → Business → Repository → Domain → Infrastructure → Test**.
+
+---
+
+### 4.0 Application Bootstrap
+
+> **Role:** Application entry point — wires the entire Spring container, activates auto-configuration, starts the embedded web server, and registers all beans declared across the other layers.  
+> **Pattern:** Convention-over-configuration (`@SpringBootApplication` = `@Configuration` + `@EnableAutoConfiguration` + `@ComponentScan`). The bootstrap layer is intentionally thin — it owns zero business logic.  
+> **Key Features:** Auto-configuration · Starter dependency management · Embedded Apache Tomcat (virtual-thread mode) · Spring Boot Actuator (health / metrics / info) · `RestClient.Builder` auto-bean · `springdoc-openapi` Swagger UI auto-registration.
+
+```mermaid
+flowchart TB
+    subgraph BOOT["Application Bootstrap — UniversityApplication.java"]
+        MAIN["main()
+SpringApplication.run()"]
+
+        subgraph AUTO["Auto-Configuration (spring.factories / @AutoConfiguration)"]
+            JPA["JPA / Hibernate
+auto-configured DataSource
+EntityManagerFactory"]
+            WEB["Spring MVC
+auto-configured DispatcherServlet
+Jackson ObjectMapper"]
+            ACT["Actuator
+/actuator/health
+/actuator/metrics
+/actuator/info"]
+            RC["RestClient.Builder
+auto-bean injected into
+CourseController"]
+            SW["springdoc-openapi
+Swagger UI auto-registered
+/swagger-ui.html"]
+        end
+
+        MAIN --> AUTO
+    end
+
+    subgraph STARTERS["spring-boot-starter-* Dependency Graph"]
+        S1["spring-boot-starter-web
+Tomcat + Spring MVC + Jackson"]
+        S2["spring-boot-starter-data-jpa
+Hibernate + Spring Data"]
+        S3["spring-boot-starter-actuator
+Health / Metrics / Info"]
+        S4["spring-boot-starter-data-rest
+HAL browser + RepositoryRestResource"]
+    end
+
+    BOOT --> WEB_LAYER["4.1 Web Layer"]
+    STARTERS -.provides.-> BOOT
+```
+
+#### 4.0a — `@SpringBootApplication` Decomposition
+
+| Meta-annotation | What it activates | Practical effect in this project |
+|---|---|---|
+| `@Configuration` | Marks the class as a bean-definition source | `@Bean` methods here are added to the Spring context |
+| `@EnableAutoConfiguration` | Scans `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` | Configures DataSource, Hibernate, Tomcat, Jackson, Actuator without any XML |
+| `@ComponentScan` | Scans `com.example.university` and all sub-packages | Discovers `@RestController`, `@Service`, `@Repository`, `@RestControllerAdvice` automatically |
+
+#### 4.0b — Spring Boot vs Spring Cloud Responsibility Split
+
+> **Mental model:** Spring Boot builds the **individual service**. Spring Cloud coordinates **many services talking to each other**.
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Spring Cloud  — Distributed System Coordination Layer   │
+│  Circuit Breaker · Config Server · Service Discovery     │
+│  Client-Side Load Balancer · API Gateway                 │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Spring Boot  — Individual Service Platform Layer  │  │
+│  │  Auto-configuration · Embedded Tomcat · Actuator   │  │
+│  │  Starter dependencies · Virtual Threads            │  │
+│  │  ┌──────────────────────────────────────────────┐  │  │
+│  │  │  Business Application Code                   │  │  │
+│  │  │  Web · Service · Repository · Domain         │  │  │
+│  │  └──────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### 4.0c — Actuator Endpoints Reference
+
+| Endpoint | HTTP | Output | Used in K8s |
+|---|---|---|---|
+| `/actuator/health` | `GET` | `{"status":"UP"}` + component details | **Liveness probe** + **Readiness probe** |
+| `/actuator/health/liveness` | `GET` | JVM alive | `livenessProbe.httpGet.path` |
+| `/actuator/health/readiness` | `GET` | DB connection + dependencies ready | `readinessProbe.httpGet.path` |
+| `/actuator/metrics` | `GET` | Micrometer metric names | Scraped by Prometheus via `/actuator/prometheus` |
+| `/actuator/info` | `GET` | App version, build info | Deployment dashboards |
+| `/actuator/env` | `GET` | All resolved property sources | Configuration debugging |
 
 ---
 
@@ -541,66 +632,102 @@ Usage in Java 21 sealed switch (exhaustive — no default):
 
 ### 4.5 Infrastructure
 
-> **Role:** Runtime boundary — provides compute, data storage, configuration, and external integrations that all layers depend on.  
-> **Pattern:** Containerised local development via Docker Compose; multi-stage Dockerfile producing a lean Alpine JRE 21 image; single-property virtual thread enablement.  
-> **Key Features:** `postgres:16` Docker Compose with readiness health check · Multi-stage Dockerfile (Maven build → JRE 21 Alpine, ~80 MB final image) · `spring.threads.virtual.enabled=true` (Java 21 Virtual Threads) · `springdoc-openapi 2.5.0` Swagger UI · H2 `MODE=PostgreSQL` for test parity.
+> **Role:** Runtime boundary — provides every platform capability required to run, scale, observe, and operate `university-modern` across local development, CI/CD, and production multi-cloud Kubernetes environments.  
+> **Pattern:** Five progressive tiers: **Local Dev** (Docker Compose) → **Spring Boot Platform** (embedded server + Actuator) → **Spring Cloud Coordination** (Config / Discovery / Load Balancer / Circuit Breaker) → **Container Runtime** (Docker image) → **Multi-Cloud Kubernetes** (AWS EKS · Azure AKS · GCP GKE).  
+> **Key Features:** Spring Boot Actuator K8s health probes · Spring Cloud Config (centralised config) · Spring Cloud Service Discovery (Eureka / K8s service) · Spring Cloud LoadBalancer (client-side) · Resilience4j Circuit Breaker · Multi-stage Dockerfile (~80 MB Alpine JRE 21) · Kubernetes `Deployment`, `Service`, `ConfigMap`, `HorizontalPodAutoscaler` · Micrometer → Prometheus → Grafana observability stack.
 
 ```mermaid
 flowchart TB
-    subgraph LOCAL["Local Development — docker compose up"]
-        direction TB
-        subgraph NET["Docker Network: university-modern_default"]
-            DB["db\npostgres:16\nport 5432\nhealthcheck pg_isready\nschema.sql mounted"]
-            APP["app\neclipse-temurin:21-jre-alpine\nport 8080\ndepends_on: db healthy\nVirtual Threads ON"]
-        end
-        DB -->|JDBC jdbc:postgresql://db:5432/catalog| APP
+    DEV["Developer Workstation"]
+
+    subgraph LOCAL["Tier 1 — Local Development"]
+        DC_DB["postgres:16\nDocker Compose db service\nhealthcheck pg_isready"]
+        DC_APP["eclipse-temurin:21-jre-alpine\nDocker Compose app service\nport 8080 · Virtual Threads ON"]
+        DC_DB -->|JDBC catalog| DC_APP
     end
 
-    subgraph BUILD["Multi-Stage Dockerfile"]
-        B1["Stage 1  Build\nmaven:3.9-eclipse-temurin-21\nmvn package -DskipTests\n~700 MB build image"]
-        B2["Stage 2  Run\neclipse-temurin:21-jre-alpine\nCOPY app.jar\nEXPOSE 8080\n~80 MB runtime image"]
-        B1 -->|COPY *.jar app.jar| B2
+    subgraph SB_PLATFORM["Tier 2 — Spring Boot Platform (embedded in every instance)"]
+        TOMCAT["Embedded Tomcat\nVirtual Thread executor\nspring.threads.virtual.enabled=true"]
+        ACTUATOR["Spring Boot Actuator\n/actuator/health · /actuator/metrics\n/actuator/prometheus · /actuator/info"]
+        PROPS["Layered Config\napplication.properties\nenv vars override → K8s ConfigMap/Secret"]
     end
 
-    subgraph TEST["Test Scope"]
-        H2["H2 In-Memory\nMODE=PostgreSQL\nddl-auto: create-drop\ndata.sql seeded\n11 staff · 3 depts · 13 courses"]
+    subgraph CLOUD["Tier 3 — Spring Cloud Coordination (add per service boundary)"]
+        CFG_SRV["Config Server\nspring-cloud-config-server\nGit-backed centralised config\napplication-{profile}.yml"]
+        DISC["Service Discovery\nSpring Cloud Eureka\nor K8s native DNS service"]
+        LB["Client-Side Load Balancer\nspring-cloud-loadbalancer\nRound-robin · zone-aware"]
+        CB["Circuit Breaker\nResilience4j + Spring Cloud\n@CircuitBreaker @Retry @Bulkhead"]
+        GW["API Gateway\nSpring Cloud Gateway\nRouting · Rate Limiting · Auth filter"]
     end
 
-    subgraph CFG["Spring Boot Config — application.properties"]
-        P1["spring.threads.virtual.enabled=true\nJava 21 Virtual Threads"]
-        P2["spring.mvc.problemdetails.enabled=true\nRFC-7807 ProblemDetail"]
-        P3["spring.jpa.show-sql=true\nSQL logging for development"]
+    subgraph CONTAINER["Tier 4 — Container Image"]
+        B1["Stage 1 Build\nmaven:3.9-eclipse-temurin-21\nmvn package -DskipTests  ~700 MB"]
+        B2["Stage 2 Runtime\neclipse-temurin:21-jre-alpine\nCOPY app.jar · EXPOSE 8080  ~80 MB"]
+        B1 -->|JAR only| B2
     end
 
-    EXT["Open Library API\nhttps://openlibrary.org\nRestClient outbound demo"]
+    subgraph K8S["Tier 5 — Multi-Cloud Kubernetes"]
+        EKS["AWS EKS\nElastic Kubernetes Service\nFargate or EC2 node groups\nRDS PostgreSQL / Aurora"]
+        AKS["Azure AKS\nAzure Kubernetes Service\nAzure Database for PostgreSQL\nAzure Container Registry"]
+        GKE["GCP GKE\nGoogle Kubernetes Engine\nCloud SQL PostgreSQL\nArtifact Registry"]
+    end
 
-    BUILD -.produces.-> APP
-    APP -.RestClient.-> EXT
-    TEST -.replaces DB.-> DB
-    CFG -.configures.-> APP
+    subgraph OBS["Observability Stack"]
+        PROM["Prometheus\nscrapes /actuator/prometheus"]
+        GRAF["Grafana\ndashboards + alerts"]
+        PROM --> GRAF
+    end
+
+    DEV --> LOCAL
+    CONTAINER -.image push.-> K8S
+    SB_PLATFORM -.runs inside.-> CONTAINER
+    CLOUD -.wraps.-> SB_PLATFORM
+    ACTUATOR -->|metrics| PROM
+    EKS & AKS & GKE -->|scrape| PROM
 ```
 
-#### 4.5a — Infrastructure Component Reference
+#### 4.5a — Infrastructure Tier Reference
 
-| Component | Technology | Scope | Config Location | Key Detail |
-|---|---|---|---|---|
-| PostgreSQL | `postgres:16` Docker image | Runtime (dev / prod-like) | `compose.yaml` | DB `catalog`, user `user`, pass `pass`; health check `pg_isready -U user -d catalog`; interval 10s, 5 retries |
-| H2 In-Memory | `com.h2database:h2` (test scope) | `@SpringBootTest` test runs | `src/test/resources/application.properties` | `MODE=PostgreSQL` for SQL compatibility; `ddl-auto=create-drop`; seeded from `data.sql` each run |
-| Dockerfile | Multi-stage: Maven JDK 21 → JRE 21 Alpine | Docker image build | Project root `Dockerfile` | Stage 1 ~700 MB build image discarded; Stage 2 ~80 MB runtime image shipped |
-| Docker Compose | `compose.yaml` | Local orchestration | Project root | `db` service starts first; `app` depends on `db` health check passing before starting |
-| Virtual Threads | JVM / Tomcat integration (Spring Boot 3.2+) | Runtime | `application.properties` | One line: `spring.threads.virtual.enabled=true` replaces entire Tomcat platform thread pool |
-| Swagger UI | `springdoc-openapi 2.5.0` | Runtime (dev) | `pom.xml` dependency | `http://localhost:8080/swagger-ui.html` and `http://localhost:8080/v3/api-docs` |
-| Open Library API | External REST — `https://openlibrary.org` | Demo only | `CourseController` (hardcoded base URL) | Demonstrates Spring Boot 3.2+ `RestClient.Builder` auto-configuration |
+| Tier | Technology | Scope | Purpose |
+|---|---|---|---|
+| Local Dev | Docker Compose (`compose.yaml`) | Developer workstation | Zero-install full-stack: `docker compose up` starts PostgreSQL + app with health-check ordering |
+| Spring Boot Platform | Embedded Tomcat · Actuator · Virtual Threads | Every runtime instance | Auto-configures web server, datasource, Jackson, health probes; single JAR deployment unit |
+| Spring Cloud Config | `spring-cloud-config-server` | Centralized config service | Git-backed `application-{env}.yml` delivered to all services at startup; eliminates per-pod config drift |
+| Spring Cloud Discovery | Eureka Server / K8s DNS | Service registry | Services register on startup; clients discover peers without hard-coded URLs |
+| Spring Cloud LoadBalancer | `spring-cloud-loadbalancer` | Client (in-process) | Round-robin or weighted client-side LB replacing deprecated Ribbon; integrates with `RestClient` |
+| Resilience4j Circuit Breaker | `spring-cloud-circuitbreaker-resilience4j` | Client (in-process) | `@CircuitBreaker` + `@Retry` + `@Bulkhead` on `RestClient` calls; prevents cascade failure |
+| Spring Cloud Gateway | `spring-cloud-gateway` | Edge / API Gateway | Single ingress: routing, rate limiting, JWT auth filter, CORS; replaces Zuul |
+| Container Image | Multi-stage Dockerfile | CI/CD + K8s | Stage 1 ~700 MB build discarded; Stage 2 ~80 MB JRE Alpine shipped; push to ECR / ACR / Artifact Registry |
+| AWS EKS | Elastic Kubernetes Service | AWS production | Fargate serverless nodes or EC2 node groups; RDS Aurora PostgreSQL; ALB Ingress Controller |
+| Azure AKS | Azure Kubernetes Service | Azure production | Azure CNI networking; Azure Database for PostgreSQL Flexible Server; Azure Container Registry |
+| GCP GKE | Google Kubernetes Engine | GCP production | Autopilot mode; Cloud SQL PostgreSQL; Artifact Registry; GKE Ingress (GCE LB) |
+| Observability | Micrometer → Prometheus → Grafana | All environments | Actuator exposes `/actuator/prometheus`; Prometheus scrapes; Grafana visualises JVM, HTTP, DB pool metrics |
 
-#### 4.5b — Docker Compose Start-up Order
+#### 4.5b — Spring Cloud Component Map
+
+> Each Spring Cloud component maps to a **distributed system problem**. The table below shows the problem, the Spring Cloud solution, and the configuration hook.
+
+| Distributed Problem | Spring Cloud Solution | Key Annotation / Class | Config Property |
+|---|---|---|---|
+| **Centralised configuration** | Spring Cloud Config Server | `@EnableConfigServer` on config-server app; `@RefreshScope` on consuming beans | `spring.config.import=configserver:http://config:8888` |
+| **Service discovery — registration** | Eureka Server + `@EnableDiscoveryClient` | `@EnableEurekaServer` / `@EnableDiscoveryClient` | `eureka.client.service-url.defaultZone=http://eureka:8761/eureka` |
+| **Service discovery — lookup** | Spring Cloud LoadBalancer | `@LoadBalanced RestClient.Builder` | `spring.cloud.loadbalancer.ribbon.enabled=false` |
+| **Client-side load balancing** | `ReactorLoadBalancerExchangeFilterFunction` | Injected into `RestClient` builder | Round-robin default; custom `ServiceInstanceListSupplier` for zone-aware |
+| **Circuit breaker / fault tolerance** | Resilience4j via Spring Cloud CircuitBreaker | `@CircuitBreaker(name="extApi", fallbackMethod="fallback")` | `resilience4j.circuitbreaker.instances.extApi.slidingWindowSize=10` |
+| **Retry** | Resilience4j Retry | `@Retry(name="extApi")` | `resilience4j.retry.instances.extApi.maxAttempts=3` |
+| **Bulkhead (concurrency limit)** | Resilience4j Bulkhead | `@Bulkhead(name="extApi", type=SEMAPHORE)` | `resilience4j.bulkhead.instances.extApi.maxConcurrentCalls=25` |
+| **API Gateway / edge routing** | Spring Cloud Gateway | `RouteLocator` bean or `application.yml` routes | `spring.cloud.gateway.routes[0].uri=lb://university-service` |
+| **Distributed tracing** | Micrometer Tracing + Zipkin / OTLP | Auto-instrumented via Spring Boot Actuator | `management.tracing.sampling.probability=1.0` |
+
+#### 4.5c — Docker Compose Start-up Order (Local Dev)
 
 ```
 docker compose up
     │
     ├─▶ db (postgres:16)
     │       POSTGRES_USER=user  POSTGRES_PASSWORD=pass  POSTGRES_DB=catalog
-    │       healthcheck: pg_isready -U user -d catalog
-    │       interval: 10s · retries: 5
+    │       volume: schema.sql → /docker-entrypoint-initdb.d/
+    │       healthcheck: pg_isready -U user -d catalog  interval:10s  retries:5
     │       ↓  healthcheck passes
     │
     └─▶ app (eclipse-temurin:21-jre-alpine)
@@ -608,47 +735,131 @@ docker compose up
             SPRING_DATASOURCE_URL=jdbc:postgresql://db:5432/catalog
             SPRING_THREADS_VIRTUAL_ENABLED=true
             ↓  listening
-            http://localhost:8080
+            http://localhost:8080              (REST API)
             http://localhost:8080/swagger-ui.html
+            http://localhost:8080/actuator/health
 ```
 
-#### 4.5c — Configuration Properties Reference
+#### 4.5d — Multi-Cloud Kubernetes Deployment Pattern
 
-| Property | Runtime Value | Test Value | Effect |
+> The same OCI image is deployed to all three clouds. Only the `StorageClass`, managed database endpoint, and ingress class differ. All other K8s manifests are identical.
+
+```yaml
+# kubernetes/deployment.yaml  (cloud-agnostic)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: university-modern
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: university-modern }
+  template:
+    metadata:
+      labels: { app: university-modern }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port:  "8080"
+    spec:
+      containers:
+        - name: university-modern
+          image: <REGISTRY>/university-modern:latest   # ECR / ACR / Artifact Registry
+          ports: [{ containerPort: 8080 }]
+          env:
+            - name: SPRING_DATASOURCE_URL
+              valueFrom: { secretKeyRef: { name: db-secret, key: url } }
+            - name: SPRING_THREADS_VIRTUAL_ENABLED
+              valueFrom: { configMapKeyRef: { name: app-config, key: virtualThreads } }
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: 8080 }
+            initialDelaySeconds: 30  periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: 8080 }
+            initialDelaySeconds: 20  periodSeconds: 5
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: university-modern-hpa
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: university-modern }
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+```
+
+#### 4.5e — Cloud-Specific Differences
+
+| Concern | AWS EKS | Azure AKS | GCP GKE |
 |---|---|---|---|
-| `spring.threads.virtual.enabled` | `true` | `true` | Replaces Tomcat platform thread pool with Java 21 virtual threads; one-line scalability upgrade |
-| `spring.mvc.problemdetails.enabled` | `true` | `true` | Routes `@ExceptionHandler` return values through RFC-7807 `ProblemDetail` serialiser |
-| `spring.jpa.hibernate.ddl-auto` | `none` | `create-drop` | Runtime: schema owned by `schema.sql`; test: H2 creates fresh schema each run, dropped after |
-| `spring.sql.init.mode` | _(not set)_ | `always` | Forces `data.sql` seed to execute even when `ddl-auto` controls schema |
-| `spring.datasource.url` | `jdbc:postgresql://localhost:5432/catalog` | `jdbc:h2:mem:testdb;MODE=PostgreSQL` | Switches datasource transparently between environments |
-| `spring.jpa.show-sql` | `true` | `true` | Logs every Hibernate-generated SQL statement (development aid) |
+| **Managed K8s control plane** | EKS (managed) | AKS (managed) | GKE Autopilot (fully managed) |
+| **Node group / compute** | EC2 Auto Scaling Groups or Fargate | Virtual Machine Scale Sets | Spot / Standard node pools or Autopilot |
+| **Managed PostgreSQL** | RDS for PostgreSQL or Aurora | Azure Database for PostgreSQL Flexible Server | Cloud SQL for PostgreSQL |
+| **Container registry** | Amazon ECR | Azure Container Registry (ACR) | GCP Artifact Registry |
+| **Ingress / load balancer** | AWS Load Balancer Controller (ALB) | Application Gateway Ingress Controller (AGIC) | GCE Ingress (Google Cloud LB) |
+| **Secrets management** | AWS Secrets Manager + CSI driver | Azure Key Vault + CSI driver | GCP Secret Manager + Workload Identity |
+| **Cluster autoscaler** | Karpenter | Cluster Autoscaler | GKE Node Auto-Provisioning |
+| **Service mesh (optional)** | AWS App Mesh / Istio | Open Service Mesh / Istio | Anthos Service Mesh / Istio |
+| **Observability** | CloudWatch Container Insights | Azure Monitor + Container Insights | Cloud Monitoring + Cloud Logging |
+| **Spring Cloud Config source** | S3-backed Git / CodeCommit | Azure Repos Git | Cloud Source Repositories |
+
+#### 4.5f — Spring Boot Platform Configuration Properties
+
+| Property | Local Dev | K8s (all clouds) | Effect |
+|---|---|---|---|
+| `spring.threads.virtual.enabled` | `true` | `true` | Replaces Tomcat platform thread pool with Java 21 virtual threads — handles high concurrency with minimal memory overhead |
+| `spring.mvc.problemdetails.enabled` | `true` | `true` | Serialises `@ExceptionHandler` returns as RFC-7807 `application/problem+json` |
+| `spring.jpa.hibernate.ddl-auto` | `none` | `none` | Schema managed by `schema.sql` / Flyway migration; never auto-drop in production |
+| `spring.datasource.url` | `jdbc:postgresql://localhost:5432/catalog` | Injected from K8s Secret | Transparent datasource switch per environment |
+| `management.endpoints.web.exposure.include` | `*` | `health,info,prometheus` | Expose all Actuator endpoints locally; restrict to safe set in K8s |
+| `management.health.livenessstate.enabled` | `true` | `true` | Enables `/actuator/health/liveness` for K8s `livenessProbe` |
+| `management.health.readinessstate.enabled` | `true` | `true` | Enables `/actuator/health/readiness` for K8s `readinessProbe` |
+| `spring.config.import` | _(not set)_ | `configserver:http://config-svc:8888` | Pull centralised config from Spring Cloud Config Server at startup |
 
 ---
 
 ### 4.6 Test Layer
 
-> **Role:** Quality gate — verifies that every modern Java language feature and Spring Data integration works end-to-end against a real loaded application context and a seeded in-memory database.  
-> **Pattern:** `@SpringBootTest` full context load (not sliced) + `@Transactional` auto-rollback after each test + JUnit 5 `@Nested` for logical grouping and isolated failure reporting.  
-> **Key Features:** H2 in-memory (`MODE=PostgreSQL`) for zero-dependency test runs · `data.sql` seed (11 staff, 3 departments, 13 courses, students) · Each `@Nested` group maps to exactly one Java 17/21 language feature.
+> **Role:** Multi-level quality gate — verifies Java language features, Spring Data integrations, API contracts, and production readiness across the full testing pyramid from fast unit tests to slow infrastructure integration tests.  
+> **Pattern:** JUnit 5 `@Nested` for cohesive feature grouping · `@SpringBootTest` full context (not sliced) for end-to-end integration · `@Transactional` auto-rollback for test isolation · Testcontainers (roadmap) for real PostgreSQL parity in CI · Spring Cloud Contract (roadmap) for consumer-driven API contracts.  
+> **Key Features:** H2 in-memory (`MODE=PostgreSQL`) for zero-dependency unit speed · `data.sql` seed (11 staff, 3 departments, 13 courses, students) · Each `@Nested` group maps to one Java 17/21 language feature · Actuator health probe testable via `TestRestTemplate` · K8s readiness verified by `/actuator/health/readiness` assertions.
 
 ```mermaid
 flowchart TB
-    subgraph MT["ModernFeaturesTest\n@SpringBootTest  @Transactional"]
-        RT["RecordTests\n@Nested\nJava 17 record Person\naccessors · value equality · JPA persistence"]
-        SI["SealedInterfaceTests\n@Nested\nJava 17 sealed EnrollmentStatus\npermits Active/Graduated/Suspended"]
-        PM["PatternMatchingTests\n@Nested\nJava 17 instanceof pattern\ndescribeFilter() dispatch"]
-        SC["SequencedCollectionTests\n@Nested\nJava 21 getFirst/getLast/reversed\nnon-mutating contract verified"]
-        SS["SealedSwitchTests\n@Nested\nJava 21 sealed switch deconstruction\ndescribeEnrollment() all 3 types"]
+    subgraph PYRAMID["Test Pyramid — university-modern"]
+        direction TB
+
+        subgraph L1["Layer 1 — Unit Tests (fast, no Spring context)"]
+            U1["CourseFilter logic\nOptional combinatorics"]
+            U2["EnrollmentStatus\nsealed type construction"]
+            U3["Person record\nvalue equality / toString"]
+        end
+
+        subgraph L2["Layer 2 — Integration Tests (Spring context + H2)"]
+            direction TB
+            MT["ModernFeaturesTest\n@SpringBootTest @Transactional\nH2 MODE=PostgreSQL"]
+            CT["SimpleDBCrudTest\n@SpringBootTest @Transactional\nH2 MODE=PostgreSQL"]
+        end
+
+        subgraph L3["Layer 3 — API / Contract Tests (roadmap)"]
+            AT["@SpringBootTest + TestRestTemplate\nHTTP endpoint assertions\nProblemDetail RFC-7807 shape"]
+            SC2["Spring Cloud Contract\nConsumer-Driven CDC\nstub generation for downstream"]
+        end
+
+        subgraph L4["Layer 4 — Infrastructure / Cloud-Readiness Tests (roadmap)"]
+            TC["Testcontainers\nReal postgres:16 container\nfull schema.sql parity"]
+            HLT["K8s Health Probe Tests\n/actuator/health/liveness\n/actuator/health/readiness"]
+        end
     end
 
-    subgraph CT["SimpleDBCrudTest\n@SpringBootTest  @Transactional"]
-        CRD["JPA CRUD lifecycle\nStaff · Department · Course · Student\ncreate / findById / update / delete\nEnrollmentStatus transitions"]
-    end
+    H2["H2 In-Memory\nMODE=PostgreSQL\ndata.sql seeded"]
+    PG_REAL["postgres:16 container\nTestcontainers (roadmap)"]
 
-    H2["H2 In-Memory DB\nMODE=PostgreSQL  ddl-auto=create-drop\ndata.sql seeded before each test class\n@Transactional rollback after each test"]
-
-    MT --> H2
-    CT --> H2
+    L2 --> H2
+    L4 --> PG_REAL
 ```
 
 #### 4.6a — Test Class Summary
@@ -683,6 +894,19 @@ flowchart TB
 | `SequencedCollection.getLast()` | `SequencedCollectionTests` | Alphabetically last course name |
 | Sealed switch record deconstruct | `SealedSwitchTests` | Three distinct non-empty strings, each containing the record component value |
 
+#### 4.6d — Cloud-Readiness Test Extensions (Roadmap)
+
+> These test patterns are the next recommended additions to bring the test suite to production / cloud-deployment grade.
+
+| Test Pattern | Tool | What to Test | Cloud Relevance |
+|---|---|---|---|
+| Real PostgreSQL integration | `org.testcontainers:postgresql` | `schema.sql` DDL correctness; index coverage; full SQL compatibility vs H2 | Eliminates H2 dialect gaps before deploying to RDS / Cloud SQL / Flexible Server |
+| K8s Liveness probe | `TestRestTemplate` + `@SpringBootTest(webEnvironment=RANDOM_PORT)` | `GET /actuator/health/liveness` returns `{"status":"UP"}` | Validates K8s `livenessProbe` config before Deployment rollout |
+| K8s Readiness probe | `TestRestTemplate` | `GET /actuator/health/readiness` returns `{"status":"UP"}` with DataSource component | Validates K8s `readinessProbe`; confirms DB pool is ready before traffic is routed |
+| Consumer-Driven Contract | `spring-cloud-starter-contract-verifier` | Provider side generates WireMock stubs; consumer tests run against stubs | Prevents breaking API changes in microservice-to-microservice communication |
+| Circuit Breaker fallback | `@SpringBootTest` + mock `RestClient` stub returning 500 | `describeEnrollment()` fallback invoked; Resilience4j state transitions CLOSED → OPEN | Validates fault-tolerance behavior before deploying behind Spring Cloud Gateway |
+| Config Server refresh | `@SpringBootTest` + Spring Cloud Config test harness | `@RefreshScope` beans reload on `/actuator/refresh` POST | Ensures zero-downtime config updates work in K8s without pod restart |
+
 ---
 
-*Generated 2026-03-04 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.3.5)*
+*Generated 2026-03-04 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.3.5 · Spring Cloud · AWS EKS · Azure AKS · GCP GKE)*
