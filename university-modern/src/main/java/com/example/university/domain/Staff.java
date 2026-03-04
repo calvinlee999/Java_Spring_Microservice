@@ -12,6 +12,12 @@ import java.util.Objects;
  * two columns ({@code first_name}, {@code last_name}) directly into
  * the {@code staff_member} table — no separate join or table needed.
  *
+ * <p><b>@Version (Optimistic Locking):</b>
+ * Prevents concurrent updates from overwriting each other.
+ * Works the same way across all cloud-managed PostgreSQL services
+ * (AWS RDS/Aurora, Azure Flexible Server, GCP Cloud SQL/AlloyDB)
+ * because it's a standard JPA feature, not a cloud-specific SQL extension.
+ *
  * <p>Table: {@code staff_member}
  */
 @Entity
@@ -22,6 +28,14 @@ public class Staff {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Integer id;
+
+    /**
+     * Optimistic locking version counter — auto-managed by JPA.
+     * See {@link Course#getVersion()} for a full explanation.
+     */
+    @Version
+    @Column(name = "version")
+    private Long version;
 
     /**
      * The staff member's name.
@@ -44,10 +58,13 @@ public class Staff {
     protected Staff() {}
 
     /** @return the {@link Person} record containing this staff member's name */
-    public Person getMember() { return member; }
+    public Person  getMember()  { return member; }
 
     /** @return the auto-assigned database ID */
-    public Integer getId() { return id; }
+    public Integer getId()      { return id; }
+
+    /** @return the optimistic locking version (managed by JPA) */
+    public Long    getVersion() { return version; }
 
     @Override
     public String toString() {

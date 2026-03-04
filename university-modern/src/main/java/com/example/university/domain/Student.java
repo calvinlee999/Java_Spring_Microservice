@@ -1,6 +1,8 @@
 package com.example.university.domain;
 
 import jakarta.persistence.*;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -13,6 +15,11 @@ import java.util.Objects;
  * ({@code "ACTIVE"}, {@code "GRADUATED"}, or {@code "SUSPENDED"}).  In the service
  * layer this string is converted to an {@link com.example.university.domain.EnrollmentStatus}
  * sealed interface instance and processed with a Java 21 pattern-matching switch.
+ *
+ * <p><b>@Version (Optimistic Locking):</b>
+ * Prevents two transactions from updating the same student record at the same time
+ * and losing one of the changes.  Especially important for enrollment status updates
+ * in a cloud environment where multiple pods may handle requests concurrently.
  *
  * <p>Table: {@code student}
  */
@@ -27,6 +34,14 @@ public class Student {
     private Integer studentId;
 
     /**
+     * Optimistic locking version counter — auto-managed by JPA.
+     * See {@link Course#getVersion()} for a full explanation.
+     */
+    @Version
+    @Column(name = "version")
+    private Long version;
+
+    /**
      * The student's name — embedded from the Java 17 {@link Person} record.
      * Maps to columns {@code first_name} and {@code last_name} in the {@code student} table.
      */
@@ -37,8 +52,12 @@ public class Student {
     @Column(name = "full_time")
     private boolean fullTime;
 
-    /** Student's age in years. */
-    @Column(name = "age")
+    /**
+     * Student's age in years.  Must be ≥ 0 — a negative age is not valid.
+     */
+    @Min(value = 0, message = "Age must be 0 or greater")
+    @NotNull(message = "Age is required")
+    @Column(name = "age", nullable = false)
     private Integer age;
 
     /**
@@ -67,7 +86,7 @@ public class Student {
      *
      * @param attendee  a {@link Person} record (first + last name)
      * @param fullTime  whether the student attends full-time
-     * @param age       the student's age
+     * @param age       the student's age (must be ≥ 0)
      */
     public Student(Person attendee, boolean fullTime, Integer age) {
         this.attendee = attendee;
@@ -79,6 +98,7 @@ public class Student {
     protected Student() {}
 
     public Integer getStudentId()    { return studentId; }
+    public Long    getVersion()      { return version; }
     public Person  getAttendee()     { return attendee; }
     public boolean isFullTime()      { return fullTime; }
     public Integer getAge()          { return age; }

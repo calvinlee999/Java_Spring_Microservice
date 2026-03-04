@@ -1,10 +1,14 @@
 package com.example.university.web;
 
+import com.example.university.business.CourseFilter;
+import com.example.university.business.DynamicQueryService;
 import com.example.university.business.UniversityService;
 import com.example.university.domain.Course;
 import com.example.university.repo.CourseRepo;
+import com.example.university.repo.DepartmentRepo;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestClient;
@@ -21,24 +25,38 @@ import java.util.SequencedCollection;
  *
  * <p><b>Spring Boot 3.2+ Features demonstrated:</b>
  * <ul>
- *   <li><b>RestClient</b> — the new fluent HTTP client.  Used in
- *       {@link #getExternalLibraryInfo} to call Open Library's public API.
- *       Replaces the old, verbose {@code RestTemplate}.</li>
- *   <li><b>ProblemDetail</b> — RFC 7807 error responses are handled in
- *       {@link GlobalExceptionHandler}.  Any thrown {@link CourseNotFoundException}
- *       automatically becomes a structured JSON error.</li>
+ *   <li><b>RestClient</b> — the new fluent HTTP client, replaces {@code RestTemplate}.
+ *       Used in {@link #getExternalLibraryInfo} to query Open Library.</li>
+ *   <li><b>ProblemDetail</b> — RFC 7807 structured error responses via
+ *       {@link GlobalExceptionHandler}. Bad data → 400 JSON, missing ID → 404 JSON.</li>
  * </ul>
  *
- * <p><b>Java 21 Feature:</b> The {@link #getCoursesReversed} endpoint returns
- * a {@link SequencedCollection}, using the Java 21 {@code List.reversed()} API.
+ * <p><b>Java 21 Features:</b>
+ * <ul>
+ *   <li>{@link SequencedCollection} — {@link #getCoursesReversed} uses
+ *       {@code List.reversed()} without mutating the original list.</li>
+ * </ul>
+ *
+ * <p><b>Java 17 Feature: Record DTO</b>
+ * {@link #filterCourses} accepts a {@link CourseSearchRequest} — a Java 17
+ * {@code record}, which is an immutable data carrier that replaces verbose
+ * POJO DTOs.  Combined with {@code @Valid} it demonstrates Bean Validation on
+ * query parameters.
+ *
+ * <p><b>Production pattern: Constructor Injection</b>
+ * All dependencies are injected through the constructor (not {@code @Autowired}
+ * fields) so they can be made {@code final} — preventing accidental reassignment
+ * and making unit testing easy with plain {@code new} calls.
  */
 @Tag(name = "Courses", description = "Endpoints for browsing and searching university courses")
 @RestController
 @RequestMapping("/api/courses")
 public class CourseController {
 
-    private final UniversityService universityService;
-    private final CourseRepo        courseRepo;
+    private final UniversityService  universityService;
+    private final CourseRepo          courseRepo;
+    private final DynamicQueryService dynamicQueryService;
+    private final DepartmentRepo      departmentRepo;
 
     /**
      * Spring Boot 3.2+ auto-configures a {@link RestClient.Builder} bean.
@@ -47,11 +65,27 @@ public class CourseController {
      */
     private final RestClient restClient;
 
-    public CourseController(UniversityService universityService,
-                             CourseRepo courseRepo,
+    /**
+     * Constructor injection — Spring automatically finds and provides all listed beans.
+     * Using a constructor (instead of {@code @Autowired} fields) means every
+     * dependency is {@code final}: it cannot be changed after the object is created.
+     * That makes the controller thread-safe and easy to unit-test.
+     *
+     * @param universityService   business logic for course/staff/student operations
+     * @param courseRepo          direct JPA repository for course data
+     * @param dynamicQueryService QueryDSL-powered dynamic search service
+     * @param departmentRepo      JPA repository for department lookups by name
+     * @param restClientBuilder   Spring-provided builder for the Spring Boot 3.2+ RestClient
+     */
+    public CourseController(UniversityService  universityService,
+                             CourseRepo         courseRepo,
+                             DynamicQueryService dynamicQueryService,
+                             DepartmentRepo      departmentRepo,
                              RestClient.Builder restClientBuilder) {
-        this.universityService = universityService;
-        this.courseRepo        = courseRepo;
+        this.universityService  = universityService;
+        this.courseRepo         = courseRepo;
+        this.dynamicQueryService = dynamicQueryService;
+        this.departmentRepo      = departmentRepo;
 
         // Spring Boot 3.2+ RestClient — fluent, readable HTTP client
         // Much cleaner than old RestTemplate which required boilerplate.
@@ -162,6 +196,69 @@ public class CourseController {
     @GetMapping("/last")
     public Course getLastCourse() {
         return universityService.findLastCourse();
+    }
+
+    // -------------------------------------------------------------------------
+    // Java 17 Record DTO + Bean Validation filter endpoint
+    // -------------------------------------------------------------------------
+
+    /**
+     * Filter courses by name (partial), credit count, or department.
+     * Any combination of the three params is allowed; omit a param to skip that filter.
+     *
+     * <p><b>Java 17 Feature: Record DTO ({@link CourseSearchRequest})</b>
+     * {@code CourseSearchRequest} is a Java 17 {@code record} — a compact,
+     * immutable data class.  Instead of a full POJO (private fields, getters,
+     * constructor, equals/hashCode, toString), a record needs one line:
+     * {@code record CourseSearchRequest(String name, Integer credits, String department)}.
+     * Spring MVC maps query parameters to it via {@code @ModelAttribute}.
+     *
+     * <p><b>Bean Validation + {@code @Valid}</b>
+     * The {@code @Valid} annotation tells Spring to run the Bean Validation
+     * constraints declared on {@link CourseSearchRequest} before the method body
+     * runs.  If any constraint fails, {@link GlobalExceptionHandler#handleValidationErrors}
+     * returns a 400 response listing every violation — no manual if-statements needed.
+     *
+     * <p><b>Example requests:</b>
+     * <pre>
+     *   GET /api/courses/filter?name=english
+     *   GET /api/courses/filter?credits=3
+     *   GET /api/courses/filter?department=Humanities
+     *   GET /api/courses/filter?name=math&amp;credits=4
+     * </pre>
+     *
+     * @param search  validated query-param DTO (name max 100 chars, credits ≥ 1)
+     * @return filtered list of {@link Course} objects
+     */
+    @Operation(
+        summary     = "Filter courses by name, credits, or department",
+        description = "Java 17 Record DTO + @Valid Bean Validation + QueryDSL dynamic query demo. "
+                    + "All three parameters are optional; combine them freely."
+    )
+    @GetMapping("/filter")
+    public List<Course> filterCourses(@Valid @ModelAttribute CourseSearchRequest search) {
+        // Build the filter step-by-step (Builder pattern using CourseFilter).
+        // Each null-check below guards against optional params not being provided.
+        CourseFilter filter = CourseFilter.filterBy();
+
+        // If a name was provided, add partial-match filter
+        if (search.name() != null && !search.name().isBlank()) {
+            filter.nameLike(search.name());
+        }
+
+        // If credits were provided, add exact-match filter
+        if (search.credits() != null) {
+            filter.credits(search.credits());
+        }
+
+        // If department was provided, look it up by name and add the filter
+        if (search.department() != null && !search.department().isBlank()) {
+            departmentRepo.findByName(search.department())
+                          .ifPresent(filter::department);
+        }
+
+        // Run the QueryDSL query with whatever filters were set
+        return dynamicQueryService.filterBySpecification(filter);
     }
 
     // -------------------------------------------------------------------------

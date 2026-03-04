@@ -1,6 +1,7 @@
 package com.example.university.domain;
 
 import jakarta.persistence.*;
+import jakarta.validation.constraints.NotBlank;
 import java.util.Objects;
 
 /**
@@ -14,6 +15,12 @@ import java.util.Objects;
  * can be used to load only the name and chair name without fetching
  * the full Staff object — handy for lightweight list endpoints.
  *
+ * <p><b>@Version (Optimistic Locking):</b>
+ * If two admin users try to rename a department at the same time, JPA's
+ * version counter guarantees one of them gets an error instead of silently
+ * losing their work.  No cloud-specific SQL needed — it works on RDS,
+ * Flexible Server, and Cloud SQL identically.
+ *
  * <p>Table: {@code department}
  */
 @Entity
@@ -25,8 +32,20 @@ public class Department {
     @Column(name = "id")
     private Integer id;
 
-    /** Human-readable department name, e.g. {@code "Humanities"}. */
-    @Column(name = "name")
+    /**
+     * Optimistic locking version counter — auto-managed by JPA.
+     * See {@link Course#getVersion()} for a full explanation.
+     */
+    @Version
+    @Column(name = "version")
+    private Long version;
+
+    /**
+     * Human-readable department name, e.g. {@code "Humanities"}.
+     * Must not be blank — a nameless department would be confusing!
+     */
+    @NotBlank(message = "Department name must not be blank")
+    @Column(name = "name", nullable = false)
     private String name;
 
     /**
@@ -45,9 +64,10 @@ public class Department {
     /** Required by JPA. */
     protected Department() {}
 
-    public Integer getId()   { return id; }
-    public String  getName() { return name; }
-    public Staff   getChair(){ return chair; }
+    public Integer getId()      { return id; }
+    public Long    getVersion() { return version; }
+    public String  getName()    { return name; }
+    public Staff   getChair()   { return chair; }
 
     public void setName(String name)   { this.name = name; }
     public void setChair(Staff chair)  { this.chair = chair; }

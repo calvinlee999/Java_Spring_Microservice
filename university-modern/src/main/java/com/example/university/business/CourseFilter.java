@@ -38,6 +38,16 @@ public class CourseFilter {
     private Optional<Staff> instructor = Optional.empty();
 
     /**
+     * Filter by a partial course name (case-insensitive contains match).
+     * Empty means "any name".
+     *
+     * <p>Example: setting {@code nameLike} to {@code "eng"} would match
+     * "English Literature", "Engineering Math", etc.
+     * The database query uses SQL {@code LIKE '%eng%'} (case-insensitive).
+     */
+    private Optional<String> nameLike = Optional.empty();
+
+    /**
      * Factory method — creates a blank filter as the starting point.
      * Use the fluent setters below to add criteria.
      *
@@ -65,9 +75,21 @@ public class CourseFilter {
         return this;
     }
 
+    /**
+     * Set a partial name search term (case-insensitive).
+     * Returns {@code this} for fluent chaining.
+     *
+     * @param nameLike  the substring to search for within course names
+     */
+    public CourseFilter nameLike(String nameLike) {
+        this.nameLike = Optional.ofNullable(nameLike);
+        return this;
+    }
+
     public Optional<Department> getDepartment()  { return department; }
     public Optional<Integer>    getCredits()      { return credits; }
     public Optional<Staff>      getInstructor()   { return instructor; }
+    public Optional<String>     getNameLike()     { return nameLike; }
 
     /**
      * Tests whether a specific course satisfies all the criteria in this filter.
@@ -80,7 +102,11 @@ public class CourseFilter {
      * @return {@code true} if the course matches all set criteria
      */
     public boolean meetsCriteria(Course course) {
-        return instructor.map(i -> course.getInstructor().equals(i)).orElse(true)
+        boolean nameOk = nameLike
+                .map(n -> course.getName().toLowerCase().contains(n.toLowerCase()))
+                .orElse(true);
+        return nameOk
+            && instructor.map(i -> course.getInstructor().equals(i)).orElse(true)
             && credits.map(c -> course.getCredits().equals(c)).orElse(true)
             && department.map(d -> course.getDepartment().equals(d)).orElse(true);
     }

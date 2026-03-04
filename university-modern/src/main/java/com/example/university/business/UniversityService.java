@@ -2,8 +2,11 @@ package com.example.university.business;
 
 import com.example.university.domain.*;
 import com.example.university.repo.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.SequencedCollection;
@@ -14,6 +17,18 @@ import java.util.SequencedCollection;
  * <p>This class acts as a middleman between the web layer (controllers)
  * and the data layer (repositories).  Controllers ask this service for
  * data; the service uses repos to fetch from the database.
+ *
+ * <p><b>@Transactional (principal engineer note):</b>
+ * Every method that <em>writes</em> data ({@code create*}, {@code deleteAll})
+ * is annotated with {@code @Transactional}.  This means:
+ * <ul>
+ *   <li>All DB operations in the method run inside a single transaction.</li>
+ *   <li>If <em>anything</em> fails halfway through, the entire transaction is
+ *       rolled back — no partial saves, no corrupted data.</li>
+ *   <li>Read-only methods use {@code @Transactional(readOnly=true)}, which
+ *       tells the JPA provider (Hibernate) and the connection pool (HikariCP)
+ *       to skip dirty-checking and optimise for read throughput.</li>
+ * </ul>
  *
  * <p><b>New Java features demonstrated in this class:</b>
  * <ul>
@@ -29,7 +44,18 @@ import java.util.SequencedCollection;
  * </ul>
  */
 @Service
+@Transactional(readOnly = true)   // All methods default to read-only; write methods override below
 public class UniversityService {
+
+    /**
+     * SLF4J Logger — the standard logging facade used throughout Spring Boot apps.
+     * Think of {@code log} as a professional notepad:
+     * instead of {@code System.out.println("...")}, we call
+     * {@code log.info("...")} so messages include a timestamp, log level,
+     * and thread name — essential for debugging in Kubernetes where you
+     * tail the pod logs.
+     */
+    private static final Logger log = LoggerFactory.getLogger(UniversityService.class);
 
     private final DepartmentRepo departmentRepo;
     private final StaffRepo      staffRepo;
@@ -50,32 +76,58 @@ public class UniversityService {
     // Create methods — save new entities to the database
     // -------------------------------------------------------------------------
 
-    /** Creates and saves a new student. The {@link Person} record holds the name. */
+    /**
+     * Creates and saves a new student.
+     * {@code @Transactional} ensures the save and any cascaded operations
+     * either ALL succeed or ALL roll back — no half-saved data.
+     */
+    @Transactional
     public Student createStudent(String firstName, String lastName,
                                  boolean fullTime, int age) {
+        log.info("Creating student: {} {}, fullTime={}, age={}", firstName, lastName, fullTime, age);
         return studentRepo.save(
                 new Student(new Person(firstName, lastName), fullTime, age));
     }
 
-    /** Creates and saves a new staff member (professor or administrator). */
+    /**
+     * Creates and saves a new staff member (professor or administrator).
+     */
+    @Transactional
     public Staff createFaculty(String firstName, String lastName) {
+        log.info("Creating faculty: {} {}", firstName, lastName);
         return staffRepo.save(new Staff(new Person(firstName, lastName)));
     }
 
-    /** Creates and saves a new department with the given chair. */
+    /**
+     * Creates and saves a new department with the given chair.
+     */
+    @Transactional
     public Department createDepartment(String name, Staff chair) {
+        log.info("Creating department: '{}' chaired by {} {}",
+                name, chair.getMember().firstName(), chair.getMember().lastName());
         return departmentRepo.save(new Department(name, chair));
     }
 
-    /** Creates and saves a new course with no prerequisites. */
+    /**
+     * Creates and saves a new course with no prerequisites.
+     */
+    @Transactional
     public Course createCourse(String name, int credits,
                                Staff professor, Department department) {
+        log.info("Creating course: '{}' ({} credits) in dept '{}'",
+                name, credits, department.getName());
         return courseRepo.save(new Course(name, credits, professor, department));
     }
 
-    /** Creates a new course and links prerequisite courses to it. */
+    /**
+     * Creates a new course and links one or more prerequisite courses to it.
+     * {@code @Transactional} guarantees the course AND all prerequisites are
+     * saved together or not at all.
+     */
+    @Transactional
     public Course createCourse(String name, int credits, Staff professor,
                                Department department, Course... prereqs) {
+        log.info("Creating course '{}' with {} prerequisite(s)", name, prereqs.length);
         Course c = new Course(name, credits, professor, department);
         for (Course p : prereqs) {
             c.addPrerequisite(p);
@@ -214,13 +266,16 @@ public class UniversityService {
 
     /**
      * Deletes all student records (used in tests to reset state).
-     * Wrapped in try/catch because cascade constraints can sometimes cause issues.
+     * Proper SLF4J logging replaces {@code System.err.println}
+     * so the message appears in structured log output (K8s pod logs, CloudWatch, etc.).
      */
+    @Transactional
     public void deleteAll() {
         try {
+            log.warn("deleteAll() called — removing all student records");
             studentRepo.deleteAll();
         } catch (Exception e) {
-            System.err.println("Could not delete all students: " + e.getMessage());
+            log.error("deleteAll() failed: {}", e.getMessage(), e);
         }
     }
 }

@@ -71,6 +71,11 @@ public class DynamicQueryService {
                     predicates.add(criteriaBuilder.equal(root.get("credits"), c)));
             filter.getInstructor().ifPresent(i ->
                     predicates.add(criteriaBuilder.equal(root.get("instructor"), i)));
+            // nameLike: lower(name) LIKE lower('%searchTerm%') — case-insensitive contains match
+            filter.getNameLike().ifPresent(n ->
+                    predicates.add(criteriaBuilder.like(
+                            criteriaBuilder.lower(root.get("name")),
+                            "%" + n.toLowerCase() + "%")));
 
             // Combine all predicates with AND.
             return criteriaBuilder.and(predicates.toArray(new Predicate[0]));

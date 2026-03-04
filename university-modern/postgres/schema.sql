@@ -13,39 +13,51 @@
 -- Staff members: first name + last name stored as separate columns.
 -- When Person becomes a Java record (@Embeddable), Hibernate still maps
 -- firstName() → first_name and lastName() → last_name here.
+-- version: managed by JPA @Version — prevents two users from overwriting each
+--          other's changes at the same time (optimistic locking / lost-update protection).
 CREATE TABLE staff_member (
   id         SERIAL PRIMARY KEY,
   first_name VARCHAR(100) NOT NULL,
-  last_name  VARCHAR(100) NOT NULL
+  last_name  VARCHAR(100) NOT NULL,
+  version    BIGINT       NOT NULL DEFAULT 0
 );
 
 -- Departments: each has a name and a chair (a staff member who runs it).
+-- version: JPA optimistic locking — if two requests try to rename the same
+--          department simultaneously, only the first one wins; the second gets
+--          an OptimisticLockException instead of silently overwriting data.
 CREATE TABLE department (
   id       SERIAL PRIMARY KEY,
   name     VARCHAR(100) NOT NULL,
-  chair_id BIGINT
+  chair_id BIGINT,
+  version  BIGINT       NOT NULL DEFAULT 0
 );
 ALTER TABLE department ADD FOREIGN KEY (chair_id) REFERENCES staff_member(id);
 
 -- Students: basic info + whether they attend full-time.
 -- status stores the enrollment state: ACTIVE, GRADUATED, or SUSPENDED.
 -- This column pairs with the EnrollmentStatus sealed interface in service logic.
+-- version: JPA optimistic locking — prevents concurrent status updates from stomping each other.
 CREATE TABLE student (
   id         SERIAL PRIMARY KEY,
   first_name VARCHAR(100) NOT NULL,
   last_name  VARCHAR(100) NOT NULL,
   age        INTEGER      NOT NULL,
   full_time  BOOLEAN      NOT NULL,
-  status     VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE'
+  status     VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
+  version    BIGINT       NOT NULL DEFAULT 0
 );
 
 -- Courses: offered by a department and taught by a staff member.
+-- version: JPA optimistic locking — prevents two professors from editing the
+--          same course record simultaneously and losing one of their changes.
 CREATE TABLE course (
   id            SERIAL PRIMARY KEY,
   name          VARCHAR(100) NOT NULL,
   credits       INTEGER      NOT NULL,
   instructor_id BIGINT       NOT NULL,
-  department_id BIGINT       NOT NULL
+  department_id BIGINT       NOT NULL,
+  version       BIGINT       NOT NULL DEFAULT 0
 );
 ALTER TABLE course ADD FOREIGN KEY (instructor_id) REFERENCES staff_member(id);
 ALTER TABLE course ADD FOREIGN KEY (department_id) REFERENCES department(id);
