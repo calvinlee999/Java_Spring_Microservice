@@ -1847,6 +1847,858 @@ Pipeline Stages
 
 ---
 
+#### 4.6f — Full E2E Architecture: App Bootstrap → Cloud Infrastructure
+
+> **Principal Quality Architect Note:**  
+> A production-grade E2E test strategy must validate **every layer in the call stack** — not just the happy path through the database. The test scope expands in concentric rings: a failing app context catches wiring bugs at zero cost; a failing circuit breaker test catches outage cascades before they reach production. This section maps each architectural layer to the correct testing tool, assertion style, and CI trigger.
+
+---
+
+##### Layer Map — Complete E2E Call Stack
+
+```
+                  E2E Test Entry Points
+                          │
+    ┌─────────────────────┼──────────────────────┐
+    │                     │                      │
+  Browser/UI          REST Client           Message Queue
+  Selenium/Cypress    RestAssured /          Kafka / SQS
+  (external user)     TestRestTemplate       Consumer tests
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  1. App Bootstrap Layer                         │
+    │     @SpringBootApplication context loads        │
+    │     All beans wired · Actuator endpoints UP     │
+    │     SPRING_PROFILES=test active                 │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  2. Web Layer (Spring MVC / Spring WebFlux)     │
+    │     @RestController endpoint routing            │
+    │     @Valid Bean Validation on @RequestBody      │
+    │     GlobalExceptionHandler ProblemDetail shape  │
+    │     HTTP status codes · response bodies         │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  3. Business Service Layer                      │
+    │     @Service @Transactional boundaries          │
+    │     @CircuitBreaker fallback invocation         │
+    │     @Retry / @Bulkhead limits enforced          │
+    │     Business rule assertions (enrollment limits)│
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  4. Repository Layer                            │
+    │     JpaRepository CRUD correctness              │
+    │     JpaSpecificationExecutor dynamic queries    │
+    │     QuerydslPredicateExecutor type-safe filters │
+    │     @Query JPQL / native SQL dialect parity     │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  5. Domain Layer                                │
+    │     @Entity integrity · @Version optimistic lock│
+    │     @Embeddable record Person round-trip        │
+    │     sealed EnrollmentStatus DB ↔ Java mapping  │
+    │     Bean Validation @NotBlank / @Min / @Max     │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  6. Infrastructure Layer                        │
+    │     Real PostgreSQL via Testcontainers          │
+    │     schema.sql DDL correctness on real engine   │
+    │     HikariCP pool tuning · connection lifecycle │
+    │     Cache (Redis) TTL · eviction policy         │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  7. Spring Cloud Coordination Layer             │
+    │     Config Server: @RefreshScope reload         │
+    │     Eureka: service registry UP/DOWN detection  │
+    │     Gateway: route filter chain execution       │
+    │     Circuit Breaker: CLOSED → OPEN → HALF-OPEN  │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  8. Container / K8s Runtime Layer               │
+    │     Docker image starts with correct JVM flags  │
+    │     /actuator/health/liveness → 200 UP          │
+    │     /actuator/health/readiness → 200 UP         │
+    │     Graceful shutdown: in-flight requests drain  │
+    └─────────────────────────────────────────────────┘
+                          │
+                          ▼
+    ┌─────────────────────────────────────────────────┐
+    │  9. Multi-Cloud Managed Services                │
+    │     AWS RDS / Aurora PostgreSQL connectivity    │
+    │     Azure Flexible Server / Cosmos for pg       │
+    │     GCP Cloud SQL / AlloyDB Omni                │
+    │     SSL/TLS · IAM auth · VNet / PrivateLink     │
+    └─────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart TD
+    subgraph TOOLS["E2E Tools per Layer"]
+        L1T["🥾 App Bootstrap\n@SpringBootTest\ncontext loads\nActuator /health"]
+        L2T["🌐 Web Layer\nTestRestTemplate\nRestAssured\nMockMvc (sliced)"]
+        L3T["⚙️ Service Layer\n@SpringBootTest\nMockito stubs\nResilience4j test harness"]
+        L4T["🗄️ Repository Layer\nTestcontainers postgres:16\n@DataJpaTest (sliced)\n@Sql seed scripts"]
+        L5T["🏛️ Domain Layer\nJUnit 5 pure unit\nno Spring context\nAssertJ assertions"]
+        L6T["🔧 Infrastructure\nTestcontainers\nRedis · Kafka containers\nSchema migration validate"]
+        L7T["☁️ Spring Cloud\nWireMock stubs\nSpring Cloud Contract\nResilience4j test events"]
+        L8T["🐋 K8s/Container\nTestcontainers + app image\nActuator health probes\nGraal native smoke test"]
+        L9T["🌍 Multi-Cloud\nEphemeral cloud DB in CI\nAWS · Azure · GCP auth\nNightly pipeline only"]
+    end
+
+    L1T --> L2T --> L3T --> L4T --> L5T --> L6T --> L7T --> L8T --> L9T
+```
+
+---
+
+#### 4.6g — Layer-by-Layer E2E Test Patterns
+
+> Each layer below shows the exact annotation, tool, assertion style, and the `@SpringBootTest` scope needed. Layers 1–5 run on every PR. Layers 6–9 are gated by test profile or CI schedule.
+
+---
+
+##### Layer 1 — App Bootstrap (Full Context Loads)
+
+```java
+/**
+ * AppContextBootstrapTest — the cheapest and most valuable E2E signal.
+ *
+ * Verifies:
+ *   1. All @Bean definitions are valid — no circular dependency, no missing @Primary
+ *   2. All @ConfigurationProperties bind correctly to application.properties
+ *   3. DataSource, EntityManagerFactory, TransactionManager wire up without error
+ *   4. Spring Boot Actuator endpoints register correctly
+ *
+ * If this test fails, nothing else in the suite is worth running.
+ * Think of it like checking the building's electrical panel before opening to visitors.
+ */
+@SpringBootTest                          // loads full ApplicationContext
+@ActiveProfiles("test")                  // uses H2 datasource, not production DB
+class AppContextBootstrapTest {
+
+    @Autowired ApplicationContext ctx;
+    @Autowired CourseRepo courseRepo;
+    @Autowired UniversityService universityService;
+    @Autowired DynamicQueryService dynamicQueryService;
+
+    @Test
+    @DisplayName("Full ApplicationContext loads without errors")
+    void contextLoads() {
+        // If any bean fails to wire, Spring throws before this line
+        assertThat(ctx).isNotNull();
+    }
+
+    @Test
+    @DisplayName("All critical beans are present in ApplicationContext")
+    void criticalBeansPresent() {
+        assertThat(ctx.containsBean("courseRepo")).isTrue();
+        assertThat(ctx.containsBean("universityService")).isTrue();
+        assertThat(ctx.containsBean("dynamicQueryService")).isTrue();
+    }
+
+    @Test
+    @DisplayName("DataSource health component is UP")
+    void dataSourceHealthUp(@Autowired HealthEndpoint health) {
+        var status = health.health().getStatus();
+        assertThat(status).isEqualTo(Status.UP);
+    }
+}
+```
+
+---
+
+##### Layer 2 — Web Layer (HTTP Request → Response)
+
+```java
+/**
+ * CourseWebLayerE2ETest — tests the full HTTP stack.
+ *
+ * RANDOM_PORT starts an actual embedded Tomcat — tests real HTTP I/O,
+ * not mocked servlet dispatch. This validates:
+ *   - @RestController routing (@GetMapping, @PostMapping)
+ *   - @Valid Bean Validation on @RequestBody
+ *   - GlobalExceptionHandler produces correct ProblemDetail (RFC 7807)
+ *   - HTTP status codes (200, 201, 400, 404, 409)
+ *   - JSON serialisation of response bodies
+ *   - Pagination headers (_links.next, page.totalElements)
+ *
+ * Think of it like hiring a real customer to walk through the front door
+ * and test the entire checkout process — not a simulated one.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+class CourseWebLayerE2ETest {
+
+    // TestRestTemplate — makes real HTTP calls (not MockMvc simulation)
+    // TestRestTemplate is auto-configured by @SpringBootTest(RANDOM_PORT)
+    @Autowired TestRestTemplate http;
+
+    // ----- Happy path -----
+
+    @Test
+    @DisplayName("GET /api/courses returns 200 with a non-empty list")
+    void getAllCourses_returns200() {
+        var response = http.getForEntity("/api/courses", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("GET /api/courses/{id} for existing course returns correct name")
+    void getCourseById_returnsCorrectBody() {
+        var response = http.getForEntity("/api/courses/1", CourseDTO.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(response.getBody().name()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("GET /api/courses/filter with credits=3 returns only 3-credit courses")
+    void filterCourses_byCredits_returnsFilteredPage() {
+        var response = http.getForEntity(
+                "/api/courses/filter?credits=3&page=0&size=10",
+                String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("\"credits\":3");
+    }
+
+    // ----- Validation / error path -----
+
+    @Test
+    @DisplayName("POST /api/courses with missing required field returns 400 ProblemDetail")
+    void createCourse_missingName_returns400() {
+        // CourseSearchRequest with null name triggers @NotBlank Bean Validation
+        var badBody = Map.of("credits", 3);   // missing "name" required field
+
+        var response = http.postForEntity("/api/courses", badBody, String.class);
+
+        // GlobalExceptionHandler maps MethodArgumentNotValidException → 400
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        // ProblemDetail RFC 7807 shape
+        assertThat(response.getBody()).contains("\"status\":400");
+        assertThat(response.getBody()).contains("\"type\"");
+    }
+
+    @Test
+    @DisplayName("GET /api/courses/{id} for non-existent course returns 404")
+    void getCourse_notFound_returns404() {
+        var response = http.getForEntity("/api/courses/99999", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    // ----- Actuator probe assertions -----
+
+    @Test
+    @DisplayName("/actuator/health/liveness returns UP — K8s livenessProbe safe")
+    void actuatorLiveness_isUp() {
+        var response = http.getForEntity("/actuator/health/liveness", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("\"status\":\"UP\"");
+    }
+
+    @Test
+    @DisplayName("/actuator/health/readiness returns UP — K8s readinessProbe safe")
+    void actuatorReadiness_isUp() {
+        var response = http.getForEntity("/actuator/health/readiness", String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("\"status\":\"UP\"");
+    }
+}
+```
+
+---
+
+##### Layer 2 — Web Layer with Rest Assured (BDD-Style)
+
+```java
+/**
+ * RestAssured provides a BDD-style DSL: given().when().then()
+ * More readable than TestRestTemplate for complex assertion chains.
+ * Useful for principal engineers who want test code to read like a contract.
+ *
+ * pom.xml: io.rest-assured:rest-assured + io.rest-assured:spring-mock-mvc
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+class CourseRestAssuredE2ETest {
+
+    @LocalServerPort int port;
+
+    @BeforeEach
+    void configureRestAssured() {
+        RestAssured.port = port;    // direct RestAssured at the running embedded server
+        RestAssured.basePath = "/api";
+    }
+
+    @Test
+    @DisplayName("Filter courses by credits=3 — BDD-style assertion")
+    void filterByCredits_bddStyle() {
+        given()
+            .queryParam("credits", 3)
+            .queryParam("page", 0)
+            .queryParam("size", 10)
+        .when()
+            .get("/courses/filter")
+        .then()
+            .statusCode(200)
+            .body("content.size()", greaterThan(0))
+            .body("content[0].credits", equalTo(3))
+            .body("page.totalElements", greaterThan(0));
+    }
+
+    @Test
+    @DisplayName("POST course with invalid payload returns RFC-7807 ProblemDetail")
+    void createCourse_invalidPayload_returnsProblemDetail() {
+        given()
+            .contentType(ContentType.JSON)
+            .body("{ \"credits\": 3 }")             // name field missing
+        .when()
+            .post("/courses")
+        .then()
+            .statusCode(400)
+            .body("status", equalTo(400))
+            .body("type", notNullValue())
+            .body("detail", notNullValue());
+    }
+}
+```
+
+---
+
+##### Layer 3 — Business Service Layer
+
+```java
+/**
+ * UniversityServiceE2ETest — tests transactional business logic.
+ *
+ * @Transactional on the test class → each test rolls back after completion.
+ * This is the critical isolation mechanism: DB state is clean for every test
+ * without needing explicit cleanup SQL, regardless of test execution order.
+ *
+ * Validates:
+ *   - @Transactional boundaries commit / rollback correctly
+ *   - @Version optimistic locking raises ObjectOptimisticLockingFailureException
+ *   - Business rules (enrollment cap, prerequisite enforcement)
+ *   - Resilience4j @CircuitBreaker fallback is invoked on simulated failure
+ */
+@SpringBootTest
+@ActiveProfiles("test")
+@Transactional    // auto-rollback after each @Test — no data bleeds between tests
+class UniversityServiceE2ETest {
+
+    @Autowired UniversityService universityService;
+    @Autowired CourseRepo courseRepo;
+
+    @Test
+    @DisplayName("Save new course persists and is retrievable within the same transaction")
+    void saveCourse_persistsCorrectly() {
+        var course = new Course(null, "Advanced Spring", 4, null, null, new ArrayList<>(), 0);
+        var saved = courseRepo.save(course);
+
+        assertThat(saved.getId()).isNotNull();
+        assertThat(courseRepo.findById(saved.getId())).isPresent();
+        // @Transactional → rolled back after test: "Advanced Spring" never in DB for real
+    }
+
+    @Test
+    @DisplayName("@Version optimistic locking prevents stale write on concurrent update")
+    void optimisticLock_preventsStaleWrite() {
+        // Load the same course twice in the same test (two detached copies)
+        var v1 = courseRepo.findById(1).orElseThrow();
+        var v2 = courseRepo.findById(1).orElseThrow();
+
+        // First write succeeds — increments @Version
+        v1.setName("Updated by v1");
+        courseRepo.saveAndFlush(v1);
+
+        // Second write on stale @Version → ObjectOptimisticLockingFailureException
+        v2.setName("Updated by v2 (stale)");
+        assertThatThrownBy(() -> courseRepo.saveAndFlush(v2))
+                .isInstanceOf(ObjectOptimisticLockingFailureException.class);
+    }
+
+    @Test
+    @DisplayName("Bean Validation @NotBlank on Course name is enforced on save")
+    void beanValidation_blankName_throwsConstraintViolation() {
+        var invalid = new Course(null, "", 3, null, null, new ArrayList<>(), 0);  // blank name
+
+        // Hibernate Validator runs @NotBlank before SQL INSERT is issued
+        assertThatThrownBy(() -> courseRepo.saveAndFlush(invalid))
+                .isInstanceOf(ConstraintViolationException.class)
+                .hasMessageContaining("name");
+    }
+}
+```
+
+---
+
+##### Layer 4 — Repository Layer (Real PostgreSQL via Testcontainers)
+
+```java
+/**
+ * CourseRepoRealPgIT — Layer 4 gate: validates all repository queries
+ * against a real postgres:16 container (not H2 approximation).
+ *
+ * Critical queries validated here that H2 cannot faithfully test:
+ *   - PostgreSQL-specific window functions in native @Query
+ *   - Full-text search (tsvector / tsquery) operators
+ *   - CHECK constraint behaviour on the real engine
+ *   - Index usage on EXPLAIN output (via pg_stat_statements)
+ *
+ * Uses @ServiceConnection (Spring Boot 3.1+) — zero manual DataSource wiring.
+ * The PostgreSQLContainer automatically injects spring.datasource.url into
+ * the test ApplicationContext via DynamicPropertySource under the hood.
+ */
+@SpringBootTest
+@ActiveProfiles("integration")
+@Testcontainers
+@Transactional
+class CourseRepoRealPgIT {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:16-alpine")
+            .withDatabaseName("university_test")
+            .withInitScript("schema.sql");      // same DDL as production — not H2 DDL
+
+    @Autowired CourseRepo courseRepo;
+    @Autowired DepartmentRepo deptRepo;
+
+    @BeforeEach
+    void seedTestData(@Autowired DataSource ds) throws Exception {
+        // Run data.sql seed via ScriptUtils for known state before each test
+        try (var conn = ds.getConnection()) {
+            ScriptUtils.executeSqlScript(conn,
+                new ClassPathResource("data.sql"));
+        }
+    }
+
+    @Test
+    @DisplayName("findByCredits JPQL text block returns correct results on real PostgreSQL")
+    void findByCredits_returnsMatchingCourses() {
+        var courses = courseRepo.findByCredits(3);
+
+        assertThat(courses).isNotEmpty()
+                .allSatisfy(c -> assertThat(c.getCredits()).isEqualTo(3));
+    }
+
+    @Test
+    @DisplayName("findByDepartmentChairMemberLastName multi-join path executes on real pg")
+    void findByChairLastName_multiJoinQuery() {
+        var results = courseRepo.findByDepartmentChairMemberLastName("Smith");
+
+        // Validates the four-table join: course → department → staff → person
+        // H2 MODE=PostgreSQL approximates this; real pg validates the actual query plan
+        assertThat(results).isNotNull();
+    }
+
+    @Test
+    @DisplayName("JpaSpecificationExecutor dynamic filter returns correct page on real pg")
+    void specificationFilter_dynamicQuery_returnsPage() {
+        var req = new CourseSearchRequest("Spring", 3, null, "Computer Science", null);
+        var page = courseRepo.findAll(
+            (root, query, cb) -> cb.like(cb.lower(root.get("name")), "%spring%"),
+            PageRequest.of(0, 10));
+
+        assertThat(page).isNotNull();
+        assertThat(page.getContent())
+                .allSatisfy(c -> assertThat(c.getName().toLowerCase()).contains("spring"));
+    }
+}
+```
+
+---
+
+##### Layer 5 — Domain Layer (Pure Unit Tests — No Spring Context)
+
+```java
+/**
+ * Domain unit tests run with JVM startup only — no Spring ApplicationContext.
+ * These are the fastest tests in the suite: < 100ms total.
+ *
+ * Validates:
+ *   - Java 17 record: accessor naming, value equality, toString format
+ *   - sealed interface: all permitted types instantiate correctly
+ *   - EnrollmentStatus: DB string → sealed type conversion
+ *   - Bean Validation annotations present and correct on domain fields
+ *
+ * Think of it like a quality-control inspector checking each part before
+ * assembly — validates the components themselves, not the assembled product.
+ */
+class DomainLayerUnitTest {
+
+    @Test
+    @DisplayName("Person record: accessor names follow record convention (no 'get' prefix)")
+    void personRecord_accessorNames() {
+        var p = new Person("Ada", "Lovelace");
+
+        // Java 17 record accessors use component name directly — NOT JavaBean getters
+        assertThat(p.firstName()).isEqualTo("Ada");    // ✅ record accessor
+        assertThat(p.lastName()).isEqualTo("Lovelace");
+        // p.getFirstName() would be a compile error — records don't generate getters
+    }
+
+    @Test
+    @DisplayName("Person record: value equality (same fields = same object)")
+    void personRecord_valueEquality() {
+        var p1 = new Person("Ada", "Lovelace");
+        var p2 = new Person("Ada", "Lovelace");
+
+        // Java records auto-generate equals() based on all components
+        assertThat(p1).isEqualTo(p2);
+        assertThat(p1).hasSameHashCodeAs(p2);
+    }
+
+    @Test
+    @DisplayName("sealed EnrollmentStatus: all three permitted types construct correctly")
+    void enrollmentStatus_allPermittedTypes() {
+        EnrollmentStatus active    = new Active("Fall 2026");
+        EnrollmentStatus graduated = new Graduated(2024);
+        EnrollmentStatus suspended = new Suspended("Academic hold");
+
+        // Validates the sealed hierarchy: Active, Graduated, Suspended all extend EnrollmentStatus
+        assertThat(active).isInstanceOf(Active.class);
+        assertThat(graduated).isInstanceOf(Graduated.class);
+        assertThat(suspended).isInstanceOf(Suspended.class);
+    }
+
+    @Test
+    @DisplayName("EnrollmentStatus.toEnrollmentStatus() converts DB strings to sealed types")
+    void enrollmentStatus_dbStringMapping() {
+        assertThat(EnrollmentStatus.toEnrollmentStatus("ACTIVE"))
+                .isInstanceOf(Active.class);
+        assertThat(EnrollmentStatus.toEnrollmentStatus("GRADUATED"))
+                .isInstanceOf(Graduated.class);
+        assertThat(EnrollmentStatus.toEnrollmentStatus("SUSPENDED"))
+                .isInstanceOf(Suspended.class);
+    }
+
+    @Test
+    @DisplayName("Java 21 sealed switch with record deconstruction covers all permits")
+    void sealedSwitch_recordDeconstruction_coversAllCases() {
+        // Java 21: switch expression with record pattern deconstruction
+        // Compiler enforces exhaustiveness — missing case = compile error
+        String result = switch (new Active("Spring 2026")) {
+            case Active(var sem)       -> "Active in " + sem;
+            case Graduated(var yr)     -> "Graduated " + yr;
+            case Suspended(var reason) -> "Suspended: " + reason;
+        };
+
+        assertThat(result).isEqualTo("Active in Spring 2026");
+    }
+}
+```
+
+---
+
+##### Layer 7 — Spring Cloud Coordination Layer Tests
+
+```java
+/**
+ * Spring Cloud E2E tests validate the coordination infrastructure:
+ *   - Config Server: @RefreshScope beans reload on /actuator/refresh POST
+ *   - Circuit Breaker: state machine transitions (CLOSED → OPEN → HALF-OPEN)
+ *   - Gateway: route matches, filter chain execution, fallback response
+ *
+ * These tests use WireMock (spring-cloud-contract-wiremock) to stub downstream
+ * services — the goal is to test the coordination logic, not the business logic.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("test")
+@AutoConfigureWireMock(port = 0)   // WireMock on random port; Spring Cloud replaces service URL
+class SpringCloudCoordinationE2ETest {
+
+    @Autowired TestRestTemplate http;
+    @Autowired CircuitBreakerRegistry circuitBreakerRegistry;
+
+    // ----- Circuit Breaker state machine test -----
+
+    @Test
+    @DisplayName("Circuit Breaker transitions CLOSED → OPEN after threshold failures")
+    void circuitBreaker_opensAfterThresholdFailures() {
+        // WireMock stub: student-service returns 503 for every call
+        stubFor(get(urlEqualTo("/api/students/1"))
+                .willReturn(aResponse().withStatus(503)));
+
+        var cb = circuitBreakerRegistry.circuitBreaker("student-service-cb");
+
+        // Confirm initial state is CLOSED — all calls allowed through
+        assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+
+        // Drive enough failures to cross failureRateThreshold (50%)
+        // minimumNumberOfCalls = 5 → need 5 calls with > 50% failures
+        for (int i = 0; i < 6; i++) {
+            try {
+                http.getForEntity("/api/courses/enroll/1/student/1", String.class);
+            } catch (Exception ignored) { }
+        }
+
+        // After threshold crossed → OPEN: all subsequent calls short-circuit to fallback
+        assertThat(cb.getState()).isEqualTo(CircuitBreaker.State.OPEN);
+    }
+
+    @Test
+    @DisplayName("Circuit Breaker returns fallback response when OPEN — no exception thrown")
+    void circuitBreaker_fallbackResponse_whenOpen() {
+        // Force CB into OPEN state
+        circuitBreakerRegistry.circuitBreaker("student-service-cb")
+                .transitionToOpenState();
+
+        // Endpoint protected by @CircuitBreaker must return fallback (not 500)
+        var response = http.getForEntity("/api/courses/enroll/1/student/1", String.class);
+
+        // Fallback invoked → degraded response with 200, not 500 cascade
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("Unavailable");
+    }
+
+    // ----- @RefreshScope config reload test -----
+
+    @Test
+    @DisplayName("@RefreshScope bean reloads updated config on /actuator/refresh POST")
+    void configRefreshScope_beanReloadsOnRefresh(@Autowired UniversityService svc) {
+        // Verify initial value from test application.properties
+        int initialMax = svc.getMaxEnrollmentPerCourse();
+        assertThat(initialMax).isPositive();
+
+        // POST /actuator/refresh triggers @RefreshScope bean reconstruction
+        var refreshResponse = http.postForEntity(
+                "/actuator/refresh", null, String.class);
+        assertThat(refreshResponse.getStatusCode()).isEqualTo(HttpStatus.OK);
+
+        // After refresh, the bean is reconstructed — value re-bound from config
+        // (In a real scenario, Config Server would serve an updated value)
+        assertThat(svc.getMaxEnrollmentPerCourse()).isPositive();
+    }
+}
+```
+
+---
+
+#### 4.6h — E2E Tools & Technology Reference
+
+| Tool | Layer | Dependency | Purpose | When to Use |
+|---|---|---|---|---|
+| **JUnit 5** (`junit-jupiter`) | All layers | `spring-boot-starter-test` (included) | Base test framework — lifecycle, assertions, `@Nested`, `@ParameterizedTest` | Default for every test class |
+| **AssertJ** | All layers | `spring-boot-starter-test` (included) | Fluent assertion DSL — `assertThat().isEqualTo()`, `hasSize()`, `allSatisfy()` | Prefer over JUnit `assertEquals` for readable failures |
+| **Mockito** | Layer 3 (service) | `spring-boot-starter-test` (included) | Stub/spy/verify collaborators — `@Mock`, `@InjectMocks`, `when().thenReturn()` | Unit-test service logic without Spring context |
+| **`@SpringBootTest`** | Layers 1, 2, 3, 7 | `spring-boot-starter-test` (included) | Loads full `ApplicationContext` — end-to-end wiring | Integration and E2E tests needing full bean graph |
+| **`@DataJpaTest`** | Layer 4 | `spring-boot-starter-test` (included) | Loads only JPA slice — repos + `EntityManager`, no web, no services | Repository-only tests without full context overhead |
+| **`TestRestTemplate`** | Layer 2 | `spring-boot-starter-test` (included) | Real HTTP calls to embedded server on `RANDOM_PORT` | Web layer E2E — actual HTTP I/O, not mock dispatch |
+| **`MockMvc`** | Layer 2 (sliced) | `spring-boot-starter-test` (included) | Simulated Spring MVC dispatch — no actual HTTP socket | Controller-only slice tests (`@WebMvcTest`) |
+| **Rest Assured** | Layer 2 | `io.rest-assured:rest-assured` | BDD-style `given/when/then` HTTP assertions | Readable API contract tests; JSON path extraction |
+| **Testcontainers** | Layers 4, 6, 9 | `org.testcontainers:postgresql` | Ephemeral Docker containers for real DB/infra in tests | Any test that needs real PostgreSQL (not H2) |
+| **`@ServiceConnection`** | Layer 4 | Spring Boot 3.1+ (`spring-boot-testcontainers`) | Auto-wires container URL into `DataSource` — zero `@DynamicPropertySource` boilerplate | Testcontainers + Spring Boot 3.1+ projects |
+| **WireMock** | Layer 7 | `spring-cloud-contract-wiremock` | HTTP stub server — simulates downstream service responses | Spring Cloud circuit breaker / retry / gateway tests |
+| **Spring Cloud Contract** | Layer 7 | `spring-cloud-starter-contract-verifier` | Consumer-Driven Contract testing — generates WireMock stubs from Groovy/YAML contracts | Microservice-to-microservice API stability |
+| **Cucumber** | Layers 2–4 (BDD) | `io.cucumber:cucumber-spring` | BDD `Given/When/Then` feature files — business-readable E2E scenarios | QA teams writing acceptance tests in plain English |
+| **Selenium / Cypress** | UI layer | External install | Browser automation — real user journey through the UI | Full UI E2E; login → search → enroll → confirm |
+| **Micrometer Tracing (test)** | Layer 7 | `micrometer-tracing-test` | `TestObservationRegistry` — assert that spans are created correctly | Verifying distributed trace propagation in unit tests |
+
+---
+
+#### 4.6i — Test Data Management & Isolation Strategy
+
+> **Principal Quality Engineer Rule:** Test data that bleeds between tests is the root cause of 80% of flaky test suites. The strategies below are ordered by isolation strength.
+
+##### Strategy 1 — `@Transactional` + H2 (Default, Layers 1–3)
+
+```java
+// How it works:
+// Spring wraps each @Test method in a transaction that ROLLS BACK after the test.
+// Data written inside the test is never committed to H2.
+// Result: every @Test starts with exactly data.sql state — guaranteed clean.
+
+@SpringBootTest
+@Transactional   // ← the single most important annotation for test isolation
+class ServiceLayerTest {
+
+    @Test
+    void test1_writesData() {
+        courseRepo.save(new Course(...));   // saved inside rolled-back transaction
+        // Roll back happens automatically after test method returns
+    }
+
+    @Test
+    void test2_seesCleanState() {
+        // data.sql state only — test1 data was rolled back
+        assertThat(courseRepo.count()).isEqualTo(13);   // only seed data
+    }
+}
+```
+
+**Limitation:** Does not work when the code under test runs in a **new** transaction (`@Transactional(propagation = REQUIRES_NEW)`) — that transaction commits independently before the test transaction rolls back.
+
+##### Strategy 2 — `@Sql` Script Execution (Layer 4, Testcontainers)
+
+```java
+// @Sql runs SQL scripts before (and optionally after) each test.
+// Used with Testcontainers where @Transactional rollback is not enough
+// (e.g., DDL changes, schema migration testing).
+
+@SpringBootTest
+@Testcontainers
+class RepoLayerIT {
+
+    @Container @ServiceConnection
+    static PostgreSQLContainer<?> pg = new PostgreSQLContainer<>("postgres:16")
+            .withInitScript("schema.sql");
+
+    @Test
+    @Sql(scripts = "/test-data/courses-seed.sql",            // runs BEFORE test
+         executionPhase = Sql.ExecutionPhase.BEFORE_TEST_METHOD)
+    @Sql(scripts = "/test-data/courses-cleanup.sql",         // runs AFTER test
+         executionPhase = Sql.ExecutionPhase.AFTER_TEST_METHOD)
+    void findByCredits_returnsCorrectCount() {
+        assertThat(courseRepo.findByCredits(3)).hasSize(5);
+    }
+}
+```
+
+##### Strategy 3 — Ephemeral Container per Test Class (Full Isolation)
+
+```java
+// Each test class gets a FRESH container — nuclear option for isolation.
+// Cost: ~3–4s extra per test class for container startup.
+// Use only for tests that mutate schema or need clean-slate infrastructure.
+
+class SchemaEvolutionIT {
+
+    // static = one container per class (default — recommended)
+    @Container @ServiceConnection
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:16").withInitScript("schema.sql");
+
+    // Non-static = new container per @Test method (very slow — only for DDL tests)
+    // @Container
+    // PostgreSQLContainer<?> freshPostgres = ...
+}
+```
+
+##### Strategy 4 — Test Database per Feature Branch (CI/CD)
+
+```yaml
+# GitHub Actions — ephemeral DB per PR (ultimate isolation, higher cost)
+# Each PR creates its own PostgreSQL service container:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: university_${{ github.sha }}   # unique DB per commit
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '21', distribution: 'temurin' }
+      - run: mvn test -Pintegration
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/university_${{ github.sha }}
+          SPRING_DATASOURCE_USERNAME: testuser
+          SPRING_DATASOURCE_PASSWORD: testpass
+```
+
+---
+
+#### 4.6j — E2E Testing Principal Best Practices
+
+1. **Test the critical user journey, not every permutation.** E2E tests are slow — a complete test suite covering every edge case will run for 45+ minutes and block every PR. Focus on 5–10 journeys: enroll a student, filter courses, fail with bad input, recover from a downstream failure. Unit and integration tests cover the edge cases.
+
+2. **Test pyramid discipline.** For every one E2E test, write ten integration tests, and a hundred unit tests. An inverted pyramid (mostly E2E) creates a slow, brittle CI/CD pipeline. The ratio is 70% unit : 20% integration : 10% E2E.
+
+3. **`@Transactional` rollback is your default isolation mechanism.** Apply it at the test class level, not per method. Any test that requires committed data (e.g., testing a separate thread's visibility) should use `@Sql` cleanup scripts instead — never leave cleanup as a manual step.
+
+4. **H2 for speed, Testcontainers for correctness.** Run H2 tests on every commit (< 30 seconds). Run Testcontainers `postgres:16` tests on every PR (< 5 minutes). Run ephemeral cloud DB tests nightly (< 20 minutes). Never run cloud DB tests on every commit — it defeats the purpose of a fast feedback loop.
+
+5. **Parameterize multi-cloud tests.** Do not write three separate test classes for AWS/Azure/GCP. Use `@ParameterizedTest` with a `DataSource` factory method that swaps the JDBC URL and auth mechanism per cloud. The same test logic validates all three environments.
+
+6. **Assert Actuator probes, not just business endpoints.** Every K8s `livenessProbe` and `readinessProbe` must have a corresponding `TestRestTemplate` assertion in the test suite. If `/actuator/health/readiness` is not tested, K8s will route traffic to pods that are not ready during DB migrations.
+
+7. **Circuit breaker tests need real state machine assertions.** Do not just catch the fallback response — assert `circuitBreakerRegistry.circuitBreaker("name").getState()` explicitly. A fallback can be triggered by timeout, not by a circuit opening — the distinction matters in production diagnosis.
+
+8. **Test data is code — version-control it.** `data.sql`, `schema.sql`, and all `@Sql` scripts must live in `src/test/resources` and be committed with the code they test. Ad-hoc test data setup in test methods leads to inconsistent state and untraceable failures.
+
+9. **Add `traceId` to test log output.** Configure `logging.pattern.console` to include `%X{traceId}` in test profiles. When a multi-service E2E test fails, the `traceId` in the log is the fastest path to the failing span — without it, you are reading through thousands of log lines from multiple services trying to correlate manually.
+
+10. **Smoke suite on every PR, full suite nightly.** Define a `@Tag("smoke")` annotation and mark the 5–10 most critical E2E tests. In `ci.yml`, run only `@Tag("smoke")` tests on PRs (< 2 minutes). Run the full suite with Testcontainers and cloud DB tests in a nightly scheduled workflow. This prevents blocking PRs on slow tests while still catching everything before release.
+
+```java
+// How to tag smoke tests and run by tag in Maven
+@Tag("smoke")   // marks this test for the nightly short-list
+@Test
+@DisplayName("[SMOKE] Full enrollment journey — create, enroll, verify, cancel")
+void fullEnrollmentJourney_smokeTest() {
+    // ... end-to-end from HTTP POST through to DB assertion
+}
+```
+
+```xml
+<!-- pom.xml: run only @Tag("smoke") tests in CI quick pass -->
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-surefire-plugin</artifactId>
+    <configuration>
+        <!-- -Dgroups=smoke  → only @Tag("smoke") tests -->
+        <!-- -DexcludedGroups=smoke → everything except smoke (nightly full run) -->
+        <groups>${test.groups}</groups>
+    </configuration>
+</plugin>
+```
+
+```yaml
+# .github/workflows/ci.yml — PR: smoke only; nightly: full suite
+on:
+  pull_request:          # PR trigger
+  schedule:
+    - cron: '0 2 * * *'  # nightly at 02:00 UTC
+
+jobs:
+  test:
+    steps:
+      - run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            mvn test -Dtest.groups=smoke
+          else
+            mvn test -Pintegration -Dtest.groups=""   # full suite
+          fi
+```
+
+---
+
+    └─▶ 4c. GCP E2E (L5c)              → already covered in 4.6e above
+
+---
+
 ## 5. Spring Cloud — Distributed System Coordination Layer
 
 > **Principal Architect Note:**  
