@@ -1532,4 +1532,1051 @@ Pipeline Stages
 
 ---
 
+## 5. Spring Cloud — Distributed System Coordination Layer
+
+> **Principal Architect Note:**  
+> Spring Boot builds one service perfectly. Spring Cloud makes many services work together reliably. This section covers every coordination concern — configuration, discovery, routing, load balancing, and fault tolerance — and maps each Spring Cloud component to its AWS-native, Azure-native, and GCP-native equivalent. The goal: understand when to use the Spring Cloud abstraction versus delegating to a cloud-managed service.
+
+---
+
+### 5.0 Mental Model — The Two-Layer Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Spring Cloud  — Distributed System Coordination Layer               │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
+│  │ Config Server│  │  API Gateway │  │   Service    │               │
+│  │ Centralised  │  │  Edge Router │  │  Discovery   │               │
+│  │ config pull  │  │  Rate limit  │  │  Eureka /    │               │
+│  │ @RefreshScope│  │  Auth/AuthZ  │  │  Cloud Map   │               │
+│  └──────────────┘  └──────────────┘  └──────────────┘               │
+│                                                                      │
+│  ┌──────────────┐  ┌──────────────┐                                  │
+│  │ Circuit      │  │ Client-Side  │                                  │
+│  │ Breaker      │  │ Load Balancer│                                  │
+│  │ Resilience4j │  │ Round-robin  │                                  │
+│  │ @CircuitBreak│  │ @LoadBalanced│                                  │
+│  └──────────────┘  └──────────────┘                                  │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  Spring Boot  — Individual Service Platform                    │  │
+│  │  Auto-config · Tomcat · Actuator · Starters · Virtual Threads  │  │
+│  │  ┌──────────────────────────────────────────────────────────┐  │  │
+│  │  │  Business Application Code                               │  │  │
+│  │  │  Web Layer · Service Layer · Repository · Domain         │  │  │
+│  │  └──────────────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Think of it like a school district:**
+- **Spring Boot** = one school building (runs perfectly on its own — teachers, classrooms, cafeteria).
+- **Spring Cloud** = the district office (coordinates all schools — transfers student records between schools, routes buses, manages the central supply warehouse, shuts a school if it's on fire).
+
+---
+
+### 5.1 Spring Cloud Components — Full Interaction Map
+
+```mermaid
+flowchart TD
+    CLIENT(["External Client\nbrowser / mobile / partner API"])
+
+    subgraph CLOUD_LAYER["Spring Cloud Coordination Layer"]
+        GW["🔀 API Gateway\nSpring Cloud Gateway\nEdge: routing · auth · rate-limit\nPort 8080"]
+        CFG["🗂️ Config Server\nSpring Cloud Config\nCentralised properties\nPort 8888"]
+        EUR["🔍 Service Registry\nEureka Server\nService registration + lookup\nPort 8761"]
+        LB["⚖️ Client-Side Load Balancer\nSpring Cloud LoadBalancer\nRound-robin / zone-aware\n(inside each service)"]
+        CB["🛡️ Circuit Breaker\nResilience4j\n@CircuitBreaker / @Retry\n(inside each service)"]
+    end
+
+    subgraph SERVICES["Spring Boot Microservices"]
+        SVC_A["📚 University Service\n:8081\n@EnableDiscoveryClient"]
+        SVC_B["👤 Student Service\n:8082\n@EnableDiscoveryClient"]
+        SVC_C["📊 Reporting Service\n:8083\n@EnableDiscoveryClient"]
+    end
+
+    DB[("🐘 PostgreSQL\nRDS / Flexible Server\nCloud SQL")]
+    TRACE["📡 Distributed Tracing\nZipkin / OTLP\nMicrometer"]
+
+    CLIENT -->|"HTTPS :443"| GW
+    GW -->|"lb://university-service"| LB
+    LB -->|"resolves from Eureka"| EUR
+    EUR -->|"registered instances"| SVC_A
+    EUR -->|"registered instances"| SVC_B
+    EUR -->|"registered instances"| SVC_C
+    LB --> SVC_A
+    LB --> SVC_B
+    LB --> SVC_C
+    SVC_A -->|"pulls config on boot"| CFG
+    SVC_B -->|"pulls config on boot"| CFG
+    SVC_C -->|"pulls config on boot"| CFG
+    SVC_A -->|CB wraps outbound call| CB
+    CB -->|"protected HTTP call"| SVC_B
+    SVC_A --> DB
+    SVC_B --> DB
+    SVC_A -.->|"trace spans"| TRACE
+    SVC_B -.->|"trace spans"| TRACE
+    GW -.->|"trace spans"| TRACE
+```
+
+---
+
+### 5.2 Config Server — Centralised Configuration Management
+
+> **Problem it solves:** In a microservices system with 10+ services and 3+ environments (dev/staging/prod), managing `application.properties` per service per environment becomes unmanageable. Config Server provides a single source of truth for all configuration, backed by Git.
+
+#### 5.2a — How It Works
+
+```
+Startup sequence for each microservice:
+
+1. Service container starts
+2. Spring Boot reads bootstrap.yml / spring.config.import
+3. Calls Config Server at http://config-svc:8888/{service-name}/{profile}
+4. Config Server fetches from Git (or S3 / Azure Repos / Vault)
+5. Returns merged properties to the service
+6. Service continues booting with resolved properties
+7. @RefreshScope beans can pick up changes via /actuator/refresh POST
+   (or Spring Cloud Bus broadcasts the refresh to all instances)
+```
+
+#### 5.2b — Spring Cloud Config Server Setup
+
+```java
+// config-server/src/main/java/ConfigServerApplication.java
+@SpringBootApplication
+@EnableConfigServer   // ← the only annotation needed; Spring Boot does the rest
+public class ConfigServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigServerApplication.class, args);
+    }
+}
+```
+
+```yaml
+# config-server/src/main/resources/application.yml
+server:
+  port: 8888
+
+spring:
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/your-org/config-repo   # Git-backed config store
+          default-label: main
+          search-paths: '{application}'   # subfolder per service name
+          # For private repo: username + password or SSH key via Secrets Manager
+          clone-on-start: true   # fail fast — don't boot if config repo unreachable
+```
+
+```yaml
+# In each microservice: spring.config.import pulls from Config Server
+# university-service/src/main/resources/application.yml
+spring:
+  application:
+    name: university-service         # Config Server uses this to find /university-service/{profile}
+  config:
+    import: optional:configserver:http://config-svc:8888
+    # "optional:" means app still boots if Config Server is temporarily unavailable
+    # Remove "optional:" in production for fail-fast behaviour
+  profiles:
+    active: prod   # → fetches university-service-prod.yml from Git repo
+```
+
+```java
+// @RefreshScope — bean is rebuilt when /actuator/refresh is called
+// Without @RefreshScope, the bean caches the property value from startup forever
+@RefreshScope
+@Service
+public class UniversityService {
+
+    @Value("${university.max-enrollment-per-course:30}")
+    private int maxEnrollmentPerCourse;   // picks up new value after refresh
+
+    // ...
+}
+```
+
+#### 5.2c — Config Layers (Precedence Low → High)
+
+```
+1. Config Server Git repo defaults (application.yml)         ← lowest priority
+2. Config Server Git repo service-specific (university-service.yml)
+3. Config Server Git repo profile-specific (university-service-prod.yml)
+4. K8s ConfigMap (env vars in pod spec)
+5. K8s Secret (SPRING_DATASOURCE_PASSWORD, etc.)             ← highest priority
+```
+
+**Principal best practice:** Secrets (passwords, API keys) must **never** be in the Git-backed Config Server. Use K8s Secrets (sourced from AWS Secrets Manager / Azure Key Vault / GCP Secret Manager via CSI driver) for credentials. Config Server handles feature flags, pool sizes, log levels, and timeouts only.
+
+#### 5.2d — AWS-Native Alternative: AWS AppConfig / Parameter Store
+
+| Spring Cloud Config | AWS AppConfig | AWS Parameter Store (SSM) |
+|---|---|---|
+| Pull on boot via HTTP | Push/poll via SDK | Pull on boot via `awspring` |
+| Git-backed | S3 / internal store | Tree-structured `/app/prod/db.url` |
+| `@RefreshScope` + Bus | Deployment strategies (Canary, Linear) | No built-in rollout |
+| Self-hosted container | Fully managed serverless | Fully managed serverless |
+| **Best for:** multi-cloud portability | **Best for:** feature flags with rollout control | **Best for:** simple key-value config + secrets |
+
+```yaml
+# Replacing Spring Cloud Config with AWS Parameter Store (awspring library)
+# pom.xml: io.awspring.cloud:spring-cloud-aws-starter-parameter-store
+spring:
+  config:
+    import: aws-parameterstore:/config/university-service/
+  cloud:
+    aws:
+      region:
+        static: us-east-1
+# SSM path /config/university-service/university.max-enrollment-per-course = 30
+```
+
+| Spring Cloud Config | Azure App Configuration | GCP Secret Manager |
+|---|---|---|
+| Git-backed HTTP pull | Managed key-value store with labels | Versioned secrets store |
+| `@RefreshScope` for live reload | Native Spring Boot integration via `azure-spring-cloud-starter-appconfiguration` | `spring-cloud-gcp-starter-secretmanager` |
+| **Best for:** multi-cloud, Git-as-source-of-truth | **Best for:** Azure-native apps with feature management | **Best for:** secret rotation on GCP |
+
+---
+
+### 5.3 Service Discovery — Registration and Lookup
+
+> **Problem it solves:** In K8s or dynamic cloud environments, pod IPs change with every deployment. Hard-coding `http://10.0.1.45:8081` breaks on the next deploy. Service Discovery lets services find each other by **logical name**, not IP.
+
+#### 5.3a — How Eureka Works
+
+```
+Boot sequence:
+  Service A starts
+    └─▶ @EnableDiscoveryClient registers with Eureka:
+          POST /eureka/apps/UNIVERSITY-SERVICE
+          { ipAddr: "10.0.3.12", port: 8081, healthCheckUrl: "/actuator/health" }
+
+Heartbeat loop (every 30s):
+  Service A → PUT /eureka/apps/UNIVERSITY-SERVICE/10.0.3.12
+  Eureka marks instance UP
+
+Service B calls Service A:
+  Service B asks Eureka: GET /eureka/apps/UNIVERSITY-SERVICE
+  Eureka returns: [ {ip: 10.0.3.12, port: 8081}, {ip: 10.0.3.15, port: 8081} ]
+  Spring Cloud LoadBalancer picks one (round-robin)
+  Service B makes HTTP call to chosen instance
+
+Failure detection:
+  If Eureka receives no heartbeat for 90s → instance marked DOWN
+  LoadBalancer stops routing to it
+```
+
+#### 5.3b — Spring Cloud Eureka Setup
+
+```java
+// eureka-server/src/main/java/EurekaServerApplication.java
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+```
+
+```yaml
+# eureka-server/src/main/resources/application.yml
+server:
+  port: 8761
+
+eureka:
+  instance:
+    hostname: eureka-server
+  client:
+    register-with-eureka: false   # server doesn't register with itself
+    fetch-registry: false         # server doesn't cache the registry locally
+  server:
+    enable-self-preservation: false   # disable in dev; enable in prod
+    # Self-preservation: if 15% of heartbeats are lost, Eureka stops evicting
+    # instances (assumes network partition, not real failures)
+```
+
+```yaml
+# Each microservice: registers itself with Eureka
+# university-service/src/main/resources/application.yml
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka
+  instance:
+    prefer-ip-address: true        # register with pod IP, not hostname
+    lease-renewal-interval-in-seconds: 10   # heartbeat interval (default 30)
+    lease-expiration-duration-in-seconds: 30 # eviction threshold (default 90)
+    health-check-url-path: /actuator/health  # Eureka uses this for UP/DOWN status
+```
+
+```java
+// In university-service — calling student-service by logical name via @LoadBalanced
+@Configuration
+public class AppConfig {
+
+    // @LoadBalanced — Spring Cloud LoadBalancer intercepts this RestClient
+    // and resolves "student-service" to a real IP from Eureka
+    @Bean
+    @LoadBalanced
+    RestClient.Builder loadBalancedRestClientBuilder() {
+        return RestClient.builder();
+    }
+}
+
+@Service
+public class UniversityService {
+
+    private final RestClient restClient;
+
+    public UniversityService(RestClient.Builder builder) {
+        // "http://student-service" — "student-service" is the Eureka service name
+        // NOT a real hostname. Spring Cloud LoadBalancer resolves it.
+        this.restClient = builder.baseUrl("http://student-service").build();
+    }
+
+    public StudentDTO getStudent(int id) {
+        return restClient.get()
+                .uri("/api/students/{id}", id)
+                .retrieve()
+                .body(StudentDTO.class);
+    }
+}
+```
+
+#### 5.3c — AWS-Native Alternative: AWS Cloud Map
+
+| Spring Cloud Eureka | AWS Cloud Map | K8s DNS (CoreDNS) |
+|---|---|---|
+| Self-hosted Java process | Fully managed serverless | Built into every K8s cluster |
+| HTTP heartbeat every 30s | Route 53 health checks | Service object ClusterIP |
+| Eureka dashboard at :8761 | AWS Console / CLI | `kubectl get svc` |
+| Works in any environment | AWS-only | K8s-only |
+| Custom eviction logic | TTL-based (DNS or API) | kube-proxy rules |
+| **Best for:** cross-cloud, non-K8s | **Best for:** AWS-native ECS/EKS mix | **Best for:** K8s-only deployments |
+
+**Principal recommendation:** In a pure Kubernetes deployment (EKS / AKS / GKE), use **K8s DNS** (`student-service.default.svc.cluster.local`) for service-to-service calls — CoreDNS is built in and requires zero setup. Eureka adds operational complexity that K8s DNS already solves. Use Eureka only for hybrid cloud or non-K8s deployments.
+
+| Concern | AWS | Azure | GCP |
+|---|---|---|---|
+| **Service registry** | AWS Cloud Map | Azure Service Fabric (legacy) / AKS CoreDNS | GCP Service Directory |
+| **DNS-based discovery** | Route 53 Private Hosted Zones | Azure Private DNS | Cloud DNS |
+| **K8s native** | EKS CoreDNS | AKS CoreDNS | GKE CoreDNS |
+
+---
+
+### 5.4 Load Balancers — Client-Side, Application, and Network
+
+> **Problem it solves:** Traffic must be distributed across multiple service instances to prevent overload and provide HA. Load balancing happens at multiple layers: inside service code (client-side), at the HTTP layer (L7/application), and at the TCP layer (L4/network).
+
+#### 5.4a — Three Types of Load Balancer
+
+```
+L7 APPLICATION LOAD BALANCER (ALB / Application Gateway / GCP HTTPS LB)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  HTTP/HTTPS + WebSocket aware
+  Routes by: URL path, hostname, HTTP headers, query params, cookies
+  Terminates TLS — unwraps HTTPS, forwards plain HTTP to pods
+  Sticky sessions (session affinity)
+  WAF integration
+  Used for: web apps, REST APIs, microservices
+
+  AWS  → Application Load Balancer (ALB)
+  Azure → Application Gateway (with WAF v2)
+  GCP  → HTTPS External Application Load Balancer
+
+L4 NETWORK LOAD BALANCER (NLB / Azure LB Standard / GCP TCP Proxy)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TCP/UDP aware — passes raw bytes through
+  No TLS termination — passes encrypted traffic to backend (TLS passthrough)
+  Ultra-low latency (microseconds vs milliseconds for ALB)
+  Static Elastic IP address (ALB has dynamic IPs)
+  Used for: gRPC, databases, gaming, VoIP, high-throughput APIs
+
+  AWS  → Network Load Balancer (NLB)
+  Azure → Azure Standard Load Balancer
+  GCP  → TCP/SSL Proxy Load Balancer
+
+CLIENT-SIDE LOAD BALANCER (Spring Cloud LoadBalancer / Ribbon)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Lives INSIDE the calling service (no separate infrastructure)
+  Queries service registry (Eureka / Cloud Map / K8s DNS)
+  Picks an instance using a strategy (round-robin / zone-aware / random)
+  Used for: service-to-service calls within the cluster
+  Advantage: no additional network hop vs external LB
+  Disadvantage: each caller must implement it
+
+  Spring Cloud → Spring Cloud LoadBalancer (replaces deprecated Ribbon)
+```
+
+#### 5.4b — Spring Cloud LoadBalancer — Deep Dive
+
+```java
+// Default behaviour: Spring Cloud LoadBalancer intercepts requests
+// via ReactorLoadBalancerExchangeFilterFunction when RestClient is @LoadBalanced
+
+// Round-robin (default): cycles through all healthy instances
+// Instance 1: request 1, 3, 5 ...
+// Instance 2: request 2, 4, 6 ...
+
+// Custom: zone-aware load balancing (prefers instances in same AZ/zone)
+// Reduces cross-AZ data transfer costs on AWS (~$0.02/GB between AZs)
+@Configuration
+public class LoadBalancerConfig {
+
+    @Bean
+    public ServiceInstanceListSupplier serviceInstanceListSupplier(
+            ConfigurableApplicationContext ctx) {
+        return ServiceInstanceListSupplier
+                .builder()
+                .withDiscoveryClient()                // pull from Eureka/Cloud Map
+                .withZonePreference()                  // prefer same AZ
+                .withHealthChecks()                    // skip DOWN instances
+                .withCaching()                         // cache 35s (avoids hammering Eureka)
+                .build(ctx);
+    }
+}
+```
+
+```yaml
+# application.yml — Spring Cloud LoadBalancer tuning
+spring:
+  cloud:
+    loadbalancer:
+      cache:
+        enabled: true
+        ttl: 35s           # how long instance list is cached locally
+        capacity: 256      # max number of service entries in cache
+      health-check:
+        initial-delay: 0
+        interval: 25s      # re-check instance health interval
+      retry:
+        enabled: true      # retry on different instance if current fails
+        max-retries-on-next-service-instance: 2
+        retry-on-all-operations: false   # only retry GET/safe methods
+        retryable-status-codes: 503, 504
+```
+
+#### 5.4c — AWS Load Balancer Comparison
+
+| Type | AWS Service | Spring / K8s Integration | Use Case |
+|---|---|---|---|
+| **Client-side** | Spring Cloud LoadBalancer (inside pod) | `@LoadBalanced` RestClient | Service-to-service calls within EKS |
+| **Application (L7)** | **ALB** — Application Load Balancer | AWS Load Balancer Controller (`ingress.kubernetes.io/scheme: internet-facing`) | External HTTPS to EKS pods; path-based routing |
+| **Network (L4)** | **NLB** — Network Load Balancer | AWS Load Balancer Controller (`service.beta.kubernetes.io/aws-load-balancer-type: external`) | TLS passthrough; gRPC; static IP requirement |
+| **Global (CDN + LB)** | **CloudFront + ALB** | CloudFront distribution in front of ALB | Global latency reduction; DDoS protection |
+| **Internal (VPC-only)** | **ALB internal** | `ingress.kubernetes.io/scheme: internal` | Service mesh entry; private microservice APIs |
+
+```yaml
+# EKS: expose university-service via ALB using AWS Load Balancer Controller
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: university-ingress
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing       # public ALB
+    alb.ingress.kubernetes.io/target-type: ip               # route to pod IPs directly
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:123:certificate/abc
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /actuator/health/readiness
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:...   # WAF integration
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api/courses
+            pathType: Prefix
+            backend:
+              service: { name: university-service, port: { number: 8080 } }
+          - path: /api/students
+            pathType: Prefix
+            backend:
+              service: { name: student-service, port: { number: 8080 } }
+```
+
+#### 5.4d — Azure and GCP Load Balancer Equivalents
+
+| Concern | AWS | Azure | GCP |
+|---|---|---|---|
+| **L7 / Application LB** | ALB | Application Gateway (WAF v2) | HTTPS External LB |
+| **L4 / Network LB** | NLB | Azure Standard Load Balancer | TCP/SSL Proxy LB |
+| **Global CDN + LB** | CloudFront + ALB | Azure Front Door (Premium) | Cloud CDN + External LB |
+| **Internal L7** | AWS ALB (internal) | Internal Application Gateway | Internal Load Balancer |
+| **Service mesh** | AWS App Mesh / Istio | Open Service Mesh / Istio | Anthos Service Mesh / Istio |
+| **K8s ingress controller** | AWS LBC (alb/nlb) | AGIC (Application Gateway) | GCE Ingress Controller |
+| **Spring annotation / annotation** | `@LoadBalanced` RestClient | `@LoadBalanced` RestClient | `@LoadBalanced` RestClient |
+
+```yaml
+# AKS: expose via Azure Application Gateway Ingress Controller (AGIC)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: university-ingress
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "30"
+spec:
+  tls:
+    - hosts: [ "university.example.com" ]
+      secretName: university-tls-secret
+  rules:
+    - host: university.example.com
+      http:
+        paths:
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service: { name: university-service, port: { number: 8080 } }
+```
+
+---
+
+### 5.5 API Gateway — Edge Routing, Auth, and Rate Limiting
+
+> **Problem it solves:** Without a gateway, every microservice must implement auth, rate limiting, CORS, SSL termination, request logging, and API versioning independently. The API Gateway is a single entry point that handles all cross-cutting concerns once, for all services.
+
+#### 5.5a — Spring Cloud Gateway Architecture
+
+```
+Client → HTTPS :443 → Spring Cloud Gateway
+                          │
+                          ├─ Route matching (path, header, method, host)
+                          ├─ Global filters (auth token validation, request logging, CORS)
+                          ├─ Per-route filters (rate limit, retry, circuit breaker, rewrite path)
+                          └─ lb://university-service  → LoadBalancer → Eureka → Pod IP
+```
+
+**Think of it like an airport security checkpoint:**  
+All passengers (requests) must pass through security (auth/rate-limit) once, regardless of which gate (service) they're heading to. Each gate (service) doesn't run its own security — it trusts that the checkpoint already handled it.
+
+#### 5.5b — Spring Cloud Gateway Configuration
+
+```yaml
+# gateway-service/src/main/resources/application.yml
+server:
+  port: 8080   # single external port for all services
+
+spring:
+  cloud:
+    gateway:
+      # Global default filters applied to EVERY route
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100    # tokens added per second
+            redis-rate-limiter.burstCapacity: 200    # max burst size
+            key-resolver: "#{@ipKeyResolver}"        # rate-limit by client IP
+        - AddResponseHeader=X-Response-Time, "{time}"
+        - DedupeResponseHeader=Access-Control-Allow-Origin
+
+      routes:
+        # Route 1 — university service
+        - id: university-service
+          uri: lb://university-service    # lb:// = Spring Cloud LoadBalancer
+          predicates:
+            - Path=/api/courses/**        # matches /api/courses and any subpath
+            - Method=GET,POST,PUT,DELETE
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: university-cb
+                fallbackUri: forward:/fallback/university
+            - name: Retry
+              args:
+                retries: 2
+                statuses: SERVICE_UNAVAILABLE, GATEWAY_TIMEOUT
+                methods: GET
+                backoff:
+                  firstBackoff: 50ms
+                  maxBackoff: 500ms
+            - RewritePath=/api/courses/(?<remaining>.*), /api/courses/${remaining}
+            - AddRequestHeader=X-Source-Gateway, spring-cloud-gateway
+
+        # Route 2 — student service (protected: JWT required)
+        - id: student-service
+          uri: lb://student-service
+          predicates:
+            - Path=/api/students/**
+          filters:
+            - name: JwtAuthentication    # custom GlobalFilter validates Bearer token
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 50
+                redis-rate-limiter.burstCapacity: 100
+
+        # Route 3 — Actuator health (public, no auth)
+        - id: health-check
+          uri: lb://university-service
+          predicates:
+            - Path=/health
+          filters:
+            - RewritePath=/health, /actuator/health
+```
+
+```java
+// Custom GlobalFilter — JWT validation applied to every route
+// except /health and /actuator/**
+@Component
+public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getPath().value();
+
+        // Skip auth for public paths
+        if (path.startsWith("/health") || path.startsWith("/actuator")) {
+            return chain.filter(exchange);
+        }
+
+        String authHeader = exchange.getRequest()
+                .getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        // Validate JWT (verify signature, expiry, claims)
+        String token = authHeader.substring(7);
+        if (!jwtService.isValid(token)) {
+            exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();
+        }
+
+        // Add decoded claims as downstream headers for microservices
+        String userId = jwtService.extractUserId(token);
+        ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+                .header("X-Authenticated-User", userId)
+                .build();
+
+        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+    }
+
+    @Override
+    public int getOrder() { return -100; }   // run before all other filters
+}
+```
+
+#### 5.5c — AWS API Gateway vs Spring Cloud Gateway
+
+| Feature | Spring Cloud Gateway | AWS API Gateway (REST) | AWS API Gateway (HTTP) | Amazon API Gateway + AppSync |
+|---|---|---|---|---|
+| **Protocol** | HTTP/1.1 · HTTP/2 · WebSocket | HTTP/1.1 · WebSocket | HTTP/1.1 · HTTP/2 | GraphQL |
+| **Hosting** | Self-hosted container (EKS pod) | Fully managed serverless | Fully managed serverless (50% cheaper than REST) | Fully managed serverless |
+| **Latency overhead** | < 1ms (in-cluster) | ~6–10ms (API calls to AWS endpoint) | ~3–5ms | Variable |
+| **Rate limiting** | Via Redis `RequestRateLimiter` filter | Built-in usage plans + API keys | Built-in throttling per route | Built-in per-connection limits |
+| **Auth / AuthN** | Custom `GlobalFilter` or Spring Security | Cognito Authorizer · Lambda Authorizer · IAM · JWT | JWT Authorizer · Lambda Authorizer | Cognito · API keys |
+| **Request transformation** | `RewritePath`, `AddRequestHeader`, `ModifyRequestBody` | Mapping templates (VTL) | Parameter mapping | Resolvers |
+| **Circuit breaker** | Resilience4j built-in filter | Not built-in — handled by backend or ALB | Not built-in | Not built-in |
+| **WebSocket support** | ✅ | ✅ (REST mode) | ❌ | ✅ (subscriptions) |
+| **Cost model** | Fixed (pod compute) | Pay per request ($3.50/million) | Pay per request ($1.00/million) | Pay per request |
+| **VPC private routing** | Native (in-cluster) | VPC Link to NLB | VPC Link to NLB/ALB | VPC routing available |
+| **Multi-cloud portable** | ✅ | ❌ AWS-only | ❌ AWS-only | ❌ AWS-only |
+| **Best for** | Multi-cloud · on-prem · fine-grained routing control | Serverless backends (Lambda) · public APIs | Low-cost HTTP proxy to backend services | GraphQL frontend |
+
+```
+                       ┌──────────────────────────────────────────┐
+                       │          API Gateway Decision             │
+                       └──────────────────────────────────────────┘
+                                          │
+                     ┌────────────────────┼────────────────────┐
+                     │                    │                    │
+              Multi-cloud?       AWS serverless?      GraphQL needed?
+              On-prem K8s?       Lambda backends?
+                     │                    │                    │
+                     ▼                    ▼                    ▼
+          Spring Cloud Gateway    AWS API Gateway HTTP    AWS AppSync
+          (in EKS pod)            or REST API             (GraphQL)
+```
+
+#### 5.5d — Azure API Management vs GCP Cloud Endpoints / Apigee
+
+| Feature | Spring Cloud Gateway | Azure API Management | GCP Cloud Endpoints | GCP Apigee |
+|---|---|---|---|---|
+| **Auth** | Custom filter | OAuth2 / JWT policy | JWT / API key | OAuth2 / JWT / mTLS |
+| **Rate limiting** | Redis `RequestRateLimiter` | Policy-based quotas | `x-google-quota` extension | Adaptive quotas |
+| **Developer portal** | None (DIY) | ✅ Built-in portal | ❌ | ✅ Full lifecycle portal |
+| **Analytics** | Micrometer / Prometheus | Azure Monitor built-in | Cloud Monitoring | Apigee Analytics suite |
+| **Caching** | Spring Cache on backend | Response caching policy | Cloud CDN | Apigee cache policy |
+| **Multi-cloud** | ✅ | ❌ Azure-only | ❌ GCP-only | ✅ (Apigee hybrid) |
+| **Platform** | Self-hosted pod | Managed PaaS | Managed serverless (OpenAPI-driven) | Managed PaaS or hybrid |
+| **Best for** | K8s-native routing | Azure APIs with developer portal | GCP gRPC services | Enterprise-grade full API lifecycle |
+
+---
+
+### 5.6 Circuit Breaker — Fault Tolerance and Resilience
+
+> **Problem it solves:** In a chain of microservices, one slow or failing service can block all threads in every upstream caller, causing a cascade failure that takes down the entire system. The circuit breaker detects the failure and "opens" — immediately returning a fallback response instead of waiting for the timeout.
+
+#### 5.6a — Circuit Breaker State Machine
+
+```
+                    failure rate > threshold
+CLOSED ─────────────────────────────────────────────► OPEN
+(normal)                                             (failing fast)
+  ▲                                                       │
+  │                                                       │ after waitDurationInOpenState
+  │                                                       ▼
+  │                                               HALF-OPEN
+  │                                           (probe: allow N calls)
+  │                                                       │
+  │  probe calls succeed                                  │  probe calls fail
+  └───────────────────────────────────────────────────────┘ ──────────► OPEN
+
+CLOSED   → all calls go through; success/failure tracked in sliding window
+OPEN     → all calls immediately fail; fallback returned
+HALF-OPEN → limited calls through to test if service recovered
+```
+
+**Think of it like a circuit breaker in your house:**  
+When a short circuit (service failure) is detected, the breaker trips (OPEN) — no more current flows to that circuit. After a cooldown (waitDuration), it halfway flips back (HALF-OPEN) to test if it's safe. If the next test passes, it fully resets (CLOSED).
+
+#### 5.6b — Resilience4j Configuration
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-circuitbreaker-resilience4j</artifactId>
+</dependency>
+```
+
+```yaml
+# application.yml — Resilience4j tuning
+resilience4j:
+  circuitbreaker:
+    instances:
+      student-service-cb:                       # name used in @CircuitBreaker
+        slidingWindowType: COUNT_BASED           # COUNT_BASED or TIME_BASED
+        slidingWindowSize: 10                    # last 10 calls evaluated
+        minimumNumberOfCalls: 5                  # need at least 5 calls before evaluation
+        failureRateThreshold: 50                 # > 50% failures → OPEN
+        slowCallRateThreshold: 80                # > 80% calls slow → also triggers OPEN
+        slowCallDurationThreshold: 2000ms        # calls > 2s counted as "slow"
+        waitDurationInOpenState: 30s             # stay OPEN 30s before trying HALF-OPEN
+        permittedNumberOfCallsInHalfOpenState: 3 # 3 probe calls in HALF-OPEN
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+
+  retry:
+    instances:
+      student-service-retry:
+        maxAttempts: 3                          # total attempts (1 original + 2 retries)
+        waitDuration: 200ms                     # wait between retries
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2         # 200ms → 400ms → 800ms
+        retryExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignoreExceptions:
+          - com.example.university.web.CourseNotFoundException  # 404 = don't retry
+
+  bulkhead:
+    instances:
+      student-service-bulkhead:
+        maxConcurrentCalls: 25                  # max parallel calls to student-service
+        maxWaitDuration: 100ms                  # wait up to 100ms for a slot; else reject
+
+  timelimiter:
+    instances:
+      student-service-tl:
+        timeoutDuration: 3s                     # call must complete within 3s
+        cancelRunningFuture: true
+```
+
+```java
+// UniversityService.java — combining Circuit Breaker + Retry + Bulkhead + TimeLimiter
+@Service
+public class UniversityService {
+
+    private final RestClient restClient;
+
+    /**
+     * Calls student-service with full fault tolerance stack:
+     *
+     * TimeLimiter  — cancel if > 3s
+     *   └── Bulkhead — reject if > 25 concurrent calls
+     *       └── CircuitBreaker — open if > 50% fail
+     *           └── Retry — retry up to 3 times on IOException
+     *               └── actual HTTP call to student-service
+     *
+     * Order matters: Retry wraps the HTTP call; CircuitBreaker wraps Retry;
+     * Bulkhead wraps CircuitBreaker; TimeLimiter wraps Bulkhead.
+     */
+    @TimeLimiter(name = "student-service-tl")
+    @Bulkhead(name = "student-service-bulkhead", type = Bulkhead.Type.SEMAPHORE)
+    @CircuitBreaker(name = "student-service-cb", fallbackMethod = "getStudentFallback")
+    @Retry(name = "student-service-retry")
+    public StudentDTO getStudent(int id) {
+        return restClient.get()
+                .uri("/api/students/{id}", id)
+                .retrieve()
+                .body(StudentDTO.class);
+    }
+
+    /**
+     * Fallback method — called when Circuit Breaker is OPEN or all retries exhausted.
+     * Method signature must match the guarded method + accept Throwable as last param.
+     *
+     * Principal rule: Always return a degraded-but-valid response.
+     * Never throw from a fallback — that defeats the purpose.
+     */
+    private StudentDTO getStudentFallback(int id, Throwable ex) {
+        log.warn("Student service unavailable for id={}, returning stub. Cause: {}",
+                id, ex.getMessage());
+        // Return a safe stub — caller can still serve the request in degraded mode
+        return new StudentDTO(id, "Unavailable", "Unavailable", -1);
+    }
+}
+```
+
+#### 5.6c — Circuit Breaker Metrics via Actuator
+
+```yaml
+# Expose Resilience4j metrics through Spring Boot Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, metrics, circuitbreakers, circuitbreakerevents
+  health:
+    circuitbreakers:
+      enabled: true   # /actuator/health shows each CB state (CLOSED/OPEN/HALF_OPEN)
+
+# GET /actuator/health response:
+# {
+#   "status": "UP",
+#   "components": {
+#     "circuitBreakers": {
+#       "status": "UP",
+#       "details": {
+#         "student-service-cb": { "status": "CIRCUIT_CLOSED", "failureRate": "10.0%" }
+#       }
+#     }
+#   }
+# }
+```
+
+```
+# GET /actuator/metrics/resilience4j.circuitbreaker.state
+{
+  "name": "resilience4j.circuitbreaker.state",
+  "measurements": [{ "statistic": "VALUE", "value": 0.0 }],   # 0=CLOSED, 1=OPEN, 2=HALF_OPEN
+  "availableTags": [
+    { "tag": "name", "values": ["student-service-cb"] },
+    { "tag": "state", "values": ["closed"] }
+  ]
+}
+```
+
+#### 5.6d — AWS-Native Fault Tolerance Equivalents
+
+| Spring / Resilience4j | AWS Native | Azure Native | GCP Native |
+|---|---|---|---|
+| **Circuit Breaker** | AWS App Mesh (Envoy proxy) retry/circuit breaker policy | Azure APIM circuit breaker policy | Cloud Service Mesh (Envoy) |
+| **Retry** | ALB target group stickiness + error retry | Azure APIM retry policy | Cloud Load Balancing backend retry |
+| **Bulkhead** | ECS task CPU/memory limits; ALB connection draining | Azure Container Apps scaling rules | GKE resource limits + HPA |
+| **Rate limiter** | API Gateway usage plans; ALB request count | APIM rate-limit policy | Cloud Armor rate limiting |
+| **Timeout** | ALB idle timeout; Lambda timeout; SDK `ClientConfiguration` | APIM timeout policy | Cloud LB backend timeout |
+| **Fallback** | Lambda Dead Letter Queue; SQS for async; EventBridge | Azure Service Bus fallback queue | Cloud Pub/Sub dead letter |
+
+**Principal recommendation:** In K8s with a service mesh (Istio / Envoy), **circuit breaking and retries can be configured at the mesh layer** (`VirtualService`, `DestinationRule`) without any application code changes. This is the recommended production pattern for K8s-native deployments:
+
+```yaml
+# Istio DestinationRule — circuit breaker at mesh level (no Java code changes)
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: student-service-cb
+spec:
+  host: student-service
+  trafficPolicy:
+    outlierDetection:
+      consecutiveGatewayErrors: 5      # 5 consecutive 5xx → eject instance
+      consecutive5xxErrors: 5
+      interval: 30s                    # evaluation window
+      baseEjectionTime: 30s            # minimum ejection duration
+      maxEjectionPercent: 50           # never eject more than 50% of pool
+    connectionPool:
+      http:
+        http1MaxPendingRequests: 100   # bulkhead: queue depth
+        http2MaxRequests: 1000         # max active requests
+```
+
+---
+
+### 5.7 Distributed Tracing — Request Journey Across Services
+
+> **Problem it solves:** When a request fails in a system of 10 microservices, finding which service caused the failure requires correlating logs from all 10. Distributed tracing assigns a single `traceId` to the original request that propagates through every service call, making end-to-end request journeys visible.
+
+#### 5.7a — Spring Boot 3 Micrometer Tracing Setup
+
+```xml
+<!-- pom.xml — Micrometer Tracing (replaces Spring Cloud Sleuth in Boot 3) -->
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-tracing-bridge-otel</artifactId>   <!-- OpenTelemetry bridge -->
+</dependency>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-exporter-otlp</artifactId>      <!-- sends to OTLP endpoint -->
+</dependency>
+```
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0    # 100% sampling in dev; use 0.1 (10%) in prod
+  otlp:
+    tracing:
+      endpoint: http://otel-collector:4318/v1/traces  # → Zipkin / Jaeger / X-Ray / Azure Monitor
+```
+
+```
+Request trace: GET /api/courses/filter → university-service → student-service
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+traceId: 4b7c9e2a3f1d8a6b
+
+  [gateway     ] span: 4b7c9e2a  0ms─────────────────────────────────100ms
+  [univ-service] span: 8a3d1c9f    5ms─────────────────────────80ms
+  [student-svc ] span: 2e6b4a8d        20ms──────────────50ms
+  [db query    ] span: 9f1c3b7e              25ms────40ms
+
+Each span contains:
+  serviceName, spanId, parentSpanId, traceId, startTime, endTime, status, HTTP method/path
+```
+
+| Tracing Backend | AWS | Azure | GCP |
+|---|---|---|---|
+| **Managed** | AWS X-Ray | Azure Monitor Application Insights | Cloud Trace |
+| **Open-source / self-hosted** | Zipkin / Jaeger on EKS | Zipkin / Jaeger on AKS | Zipkin / Jaeger on GKE |
+| **Standard** | OpenTelemetry (OTLP) → X-Ray OTLP endpoint | OpenTelemetry (OTLP) → Azure Monitor | OpenTelemetry (OTLP) → Cloud Trace |
+
+---
+
+### 5.8 Principal Recommendation Matrix — Spring Cloud vs Cloud-Native
+
+> **Key principle:** Spring Cloud components are infrastructure code you own and operate. Cloud-native managed services offload that operational burden at higher per-unit cost. Choose based on multi-cloud portability requirements, team operational maturity, and total cost of ownership.
+
+| Concern | Spring Cloud (self-managed) | AWS Native | Azure Native | GCP Native | Recommendation |
+|---|---|---|---|---|---|
+| **Config Management** | Config Server (Git-backed) | AppConfig + SSM Parameter Store | Azure App Configuration | Secret Manager + Firestore | **AWS/Azure/GCP native** for pure cloud play; Spring Cloud Config for multi-cloud or on-prem K8s |
+| **Service Discovery** | Eureka Server | Cloud Map | AKS CoreDNS / Service Fabric | Service Directory / GKE CoreDNS | **K8s DNS** inside clusters; Spring Eureka only for hybrid non-K8s |
+| **Client-Side LB** | Spring Cloud LoadBalancer | Part of AWS SDK (not client-side) | Built into Azure SDK | Built into Cloud SDK | **Spring Cloud LB** for service-to-service inside K8s; delegate to cloud LB for ingress |
+| **L7 API Gateway** | Spring Cloud Gateway | AWS API Gateway HTTP / REST | Azure API Management | GCP Apigee / Cloud Endpoints | **Spring Cloud Gateway** for complex routing in K8s; **cloud-native gateway** for serverless backends |
+| **L4 Network LB** | Not applicable | NLB  | Azure Standard LB | TCP/SSL Proxy LB | Always use **cloud-native NLB** — no Spring equivalent |
+| **Circuit Breaker** | Resilience4j | App Mesh / Istio (mesh layer) | APIM policy / Istio | Cloud Service Mesh / Istio | **Resilience4j** for library-level control; **Istio** for mesh-level (no code change) |
+| **Rate Limiting** | Spring Cloud Gateway filter + Redis | API Gateway usage plans | APIM rate-limit policy | Cloud Armor | Spring Cloud for in-cluster; cloud-native for public API edge |
+| **Distributed Tracing** | Micrometer + OTLP | AWS X-Ray | Azure Monitor / App Insights | Cloud Trace | **OpenTelemetry (OTLP)** — portable to all three clouds and self-hosted |
+| **Auth at edge** | Spring Security OAuth2 in Gateway | Cognito Authorizer | Azure AD B2C | GCP Identity Platform | Spring Security for fine-grained; cloud-native IdP for managed SSO |
+
+---
+
+### 5.9 Full Architecture — Spring Cloud on AWS EKS
+
+```mermaid
+flowchart TD
+    INTERNET(["Internet / Mobile / Partners"])
+
+    subgraph AWS_CLOUD["AWS Cloud — us-east-1"]
+        subgraph VPC["VPC 10.0.0.0/16"]
+            CF["CloudFront\nCDN + DDoS protect\nEdge cache"]
+            WAF["AWS WAF\nSQL injection\nRate limit rules"]
+            ALB["ALB — Application Load Balancer\nHTTPS :443\nTLS termination\nPath-based routing"]
+
+            subgraph EKS["EKS Cluster"]
+                subgraph SC["Spring Cloud System Services"]
+                    GW_POD["🔀 Spring Cloud Gateway\n:8080\nJWT auth · rate limit\nCB filter · path rewrite"]
+                    CFG_POD["🗂️ Config Server\n:8888\nGit-backed config pull\n/actuator/refresh"]
+                    EUR_POD["🔍 Eureka Server\n:8761\nService registry\nHeartbeat: 30s"]
+                end
+
+                subgraph BSVC["Business Microservices"]
+                    UNIV["📚 university-service\n:8081 × 3 replicas\n@EnableDiscoveryClient\nResilience4j CB"]
+                    STU["👤 student-service\n:8082 × 2 replicas\n@EnableDiscoveryClient"]
+                    RPT["📊 reporting-service\n:8083 × 2 replicas\n@EnableDiscoveryClient"]
+                end
+
+                subgraph OBS["Observability"]
+                    PROM["Prometheus\n/actuator/prometheus scrape"]
+                    GRAF["Grafana\nDashboards"]
+                    ZIP["Zipkin / Jaeger\nDistributed traces"]
+                end
+            end
+
+            subgraph DATA["Data Tier (Private Subnets)"]
+                RDS["Amazon RDS\nPostgreSQL 16\nMulti-AZ\nread replica"]
+                REDIS["ElastiCache Redis\nGateway rate limit\nSession cache"]
+                S3["S3\nConfig Server\ngit mirror"]
+            end
+
+            SSM["AWS Secrets Manager\nDB credentials\nJWT signing key"]
+            SM_CSI["K8s Secrets Store\nCSI Driver"]
+        end
+
+        subgraph DEVOPS["DevOps / CI"]
+            ECR["Amazon ECR\nContainer Registry"]
+            CODEPIPE["CodePipeline\nCI/CD"]
+        end
+    end
+
+    INTERNET -->|HTTPS| CF
+    CF --> WAF
+    WAF --> ALB
+    ALB -->|"/api/**"| GW_POD
+    GW_POD -->|"lb://university-service"| UNIV
+    GW_POD -->|"lb://student-service"| STU
+    GW_POD -->|"lb://reporting-service"| RPT
+    UNIV -->|register + heartbeat| EUR_POD
+    STU  -->|register + heartbeat| EUR_POD
+    RPT  -->|register + heartbeat| EUR_POD
+    UNIV -->|pull config on boot| CFG_POD
+    STU  -->|pull config on boot| CFG_POD
+    CFG_POD -->|fetch properties| S3
+    UNIV --> RDS
+    STU  --> RDS
+    GW_POD --> REDIS
+    SSM -->|injected via CSI| SM_CSI
+    SM_CSI -->|K8s Secret| UNIV
+    UNIV -.->|metrics| PROM
+    UNIV -.->|traces| ZIP
+    GW_POD -.->|traces| ZIP
+    PROM --> GRAF
+    ECR -->|image pull| EKS
+    CODEPIPE -->|deploy| EKS
+```
+
+---
+
+### 5.10 Cross-Cutting Best Practices
+
+1. **One gateway, many services.** All external traffic enters through a single Spring Cloud Gateway or cloud-native API gateway. Services must not expose ports directly to the internet. Use K8s `ClusterIP` (not `LoadBalancer` or `NodePort`) for all internal services.
+
+2. **Config Server must be the first service up.** In Docker Compose and K8s, use `depends_on` / init containers to ensure Config Server is healthy before any business service starts. Use `spring.config.import: optional:configserver:...` during development for tolerant startup; remove `optional:` in production for fail-fast.
+
+3. **Never put secrets in Config Server's Git repo.** Config Server handles feature flags, pool sizes, timeouts, and log levels. Credentials go into AWS Secrets Manager / Azure Key Vault / GCP Secret Manager, injected as K8s Secrets via CSI driver. Violating this exposes production credentials in Git history permanently.
+
+4. **Circuit breakers need real thresholds.** Default Resilience4j settings (`slidingWindowSize: 100`) are too large for most services. Set `minimumNumberOfCalls:5`, `slidingWindowSize:10`, `waitDurationInOpenState:30s` and tune from there based on Actuator `/actuator/metrics/resilience4j.circuitbreaker.*` data.
+
+5. **Fallback = degraded, not broken.** A circuit breaker fallback should return a safe, partial response (stub data, cached result, empty list with a `Retry-After` header) — never throw an exception. The caller should be able to serve the request in a degraded state.
+
+6. **Zone-aware load balancing cuts cloud costs.** AWS charges ~$0.02/GB for cross-AZ traffic. Configure `withZonePreference()` in `ServiceInstanceListSupplier` so services prefer instances in their own AZ. Same applies on Azure (paired regions) and GCP (zones).
+
+7. **K8s DNS supersedes Eureka inside a cluster.** Inside EKS/AKS/GKE, every `Service` object is automatically resolvable via CoreDNS as `service-name.namespace.svc.cluster.local`. Use Eureka only for environments where K8s DNS is unavailable (hybrid cloud, bare-metal, non-K8s VMs).
+
+8. **Spring Cloud Gateway is reactive (WebFlux).** It runs on Project Reactor, not Spring MVC. Do not mix blocking code in Gateway filters. Use `Mono<Void>` / `Flux<T>` only. If your Gateway logic is complex, validate it with a `WebTestClient` integration test, not `MockMvc`.
+
+9. **`@RefreshScope` has a startup lag.** After calling `/actuator/refresh`, beans annotated `@RefreshScope` are reconstructed on the next access, not immediately. In a multi-pod deployment, call `/actuator/refresh` on every pod or use **Spring Cloud Bus** (backed by Redis or RabbitMQ) to broadcast the refresh event to all instances simultaneously.
+
+10. **Distributed tracing sampling in production.** Use `management.tracing.sampling.probability=0.01` (1%) in production to prevent trace overhead. Use `1.0` in staging and development. For specific high-value traces (payment flows, auth), use a custom `Sampler` to force 100% sampling for those paths only.
+
+---
+
 *Generated 2026-03-04 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.3.5 · Spring Cloud · AWS EKS/RDS/Aurora · Azure AKS/Flexible Server/Cosmos DB for PostgreSQL · GCP GKE/Cloud SQL/AlloyDB)*
