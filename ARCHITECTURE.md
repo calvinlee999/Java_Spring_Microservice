@@ -869,13 +869,328 @@ classDiagram
 
 #### 4.3a — Repository Interface Reference
 
-| Interface | Entity | Extends | HAL Path | Spring Data Extras |
+> **Principal Architect Note:**  
+> The three Spring Data JPA repository interfaces — `JpaRepository`, `JpaSpecificationExecutor`, and `QuerydslPredicateExecutor` — are not alternatives to each other. They are **complementary layers** designed to be extended together on a single repository interface. Understanding when and why to combine them is the difference between a brittle query layer and a production-grade data access design.  
+> Cross-reference: each interface directly enables one or more of the five query strategies from [§ 4.2c](#42c--query-strategy-comparison-recommendations--best-practices).
+
+---
+
+##### Interface Hierarchy — How They Relate
+
+```
+java.io.Serializable
+    │
+    └─▶ Repository<T, ID>                (marker — no methods)
+            │
+            └─▶ CrudRepository<T, ID>    save · findById · delete · count · existsById
+                    │
+                    └─▶ PagingAndSortingRepository<T, ID>    findAll(Sort) · findAll(Pageable)
+                                │
+                                └─▶ JpaRepository<T, ID>     ← PRIMARY INTERFACE
+                                        │   flush · saveAndFlush · deleteAllInBatch
+                                        │   deleteInBatch · getReferenceById
+                                        │   findAll(Example) ← QueryByExample (QBE) built-in
+                                        │
+                                        ├─▶ + JpaSpecificationExecutor<T>   ← DYNAMIC CRITERIA
+                                        │         findOne(Specification)
+                                        │         findAll(Specification)
+                                        │         findAll(Specification, Pageable)
+                                        │         findAll(Specification, Sort)
+                                        │         count(Specification)
+                                        │         exists(Specification)
+                                        │
+                                        └─▶ + QuerydslPredicateExecutor<T>  ← TYPE-SAFE QUERYDSL
+                                                  findOne(Predicate)
+                                                  findAll(Predicate)
+                                                  findAll(Predicate, Pageable)
+                                                  findAll(Predicate, Sort)
+                                                  count(Predicate)
+                                                  exists(Predicate)
+```
+
+**Think of it like a school filing system:**  
+`JpaRepository` is the filing cabinet itself — it stores, retrieves, and deletes folders (CRUD). `JpaSpecificationExecutor` is the advanced search feature — lets you build any search rule ("all students with grade > B AND enrolled in semester X"). `QuerydslPredicateExecutor` is the type-safe version of that search — backed by a compiled index that tells you at build time if you reference a field that doesn't exist.
+
+---
+
+##### Interface 1 — `JpaRepository<T, ID>`
+
+**Purpose:** Core CRUD + pagination + sorting + Query By Example. The default choice for every Spring Data JPA repository.
+
+```java
+// DepartmentRepo.java — simplest form: only JpaRepository needed
+// No dynamic queries, no Specifications — standard CRUD + HAL exposure
+@RepositoryRestResource(collectionResourceRel = "departments", path = "departments")
+public interface DepartmentRepo extends JpaRepository<Department, Integer> {
+
+    // Derived method (Strategy 1 from §4.2c) — Spring generates:
+    // SELECT d FROM Department d WHERE d.name = :name
+    Optional<Department> findByName(String name);
+
+    // No extra interfaces needed — JpaRepository already provides:
+    //   save(entity)             → INSERT or UPDATE (merge)
+    //   findById(id)             → SELECT by PK
+    //   findAll(Pageable)        → SELECT with LIMIT/OFFSET
+    //   deleteById(id)           → DELETE by PK
+    //   existsById(id)           → SELECT COUNT(*) > 0
+    //   getReferenceById(id)     → proxy reference (no SQL until field access)
+    //   flush()                  → force SQL flush to DB within transaction
+    //   saveAndFlush(entity)     → save + immediate flush (useful in tests)
+    //   deleteAllInBatch(list)   → DELETE WHERE id IN (...) — one roundtrip
+}
+```
+
+**Key `JpaRepository`-specific methods and why they matter:**
+
+| Method | SQL Generated | When to Use |
+|---|---|---|
+| `save(entity)` | `INSERT` (new) or `UPDATE` (managed/detached) | All writes; Spring checks `@Version` / `id` null |
+| `saveAndFlush(entity)` | `INSERT`/`UPDATE` + immediate `FLUSH` | In tests: ensure DB state before assertions |
+| `deleteAllInBatch(list)` | `DELETE FROM t WHERE id IN (?,?,?)` | Bulk deletes — **much faster** than `deleteAll(list)` which iterates |
+| `getReferenceById(id)` | No SQL until field accessed | FK assignment — set `course.instructor = staffRepo.getReferenceById(3)` without loading entity |
+| `findAll(Example<T>)` | Dynamic `WHERE` based on non-null probe fields | QBE (Strategy 4 §4.2c) — built directly into `JpaRepository` |
+
+**Enables §4.2c Strategies:** 1 (Derived Methods), 2 (@Query JPQL), 3 (Native Query), 4 (QBE via `findAll(Example)`)
+
+---
+
+##### Interface 2 — `JpaSpecificationExecutor<T>`
+
+**Purpose:** Programmatic JPA Criteria API — dynamic multi-condition queries where the filter set is unknown at compile time (e.g., search forms, REST filter endpoints).
+
+```java
+// CourseRepo.java — extends BOTH JpaRepository and JpaSpecificationExecutor
+// This is the standard pattern for repositories that need both CRUD and dynamic filtering
+@RepositoryRestResource(collectionResourceRel = "courses", path = "courses")
+public interface CourseRepo
+        extends JpaRepository<Course, Integer>,
+                JpaSpecificationExecutor<Course> {           // ← adds Specification methods
+
+    // @Query JPQL (Strategy 2 §4.2c) — text block, named param
+    @Query("""
+            SELECT c FROM Course c
+            WHERE c.credits = :credits
+            ORDER BY c.name ASC
+            """)
+    List<Course> findByCredits(@Param("credits") int credits);
+
+    // Deep path navigation (Strategy 1 with joins §4.2c)
+    // Generates: JOIN department d JOIN staff s JOIN person p WHERE p.lastName = :chair
+    List<Course> findByDepartmentChairMemberLastName(@Param("chair") String chair);
+}
+```
+
+```java
+// DynamicQueryService.java — uses the Specification methods added by JpaSpecificationExecutor
+// This is Strategy 5 (JPA Criteria) from §4.2c
+@Service
+public class DynamicQueryService {
+
+    private final CourseRepo courseRepo;   // already has JpaSpecificationExecutor
+
+    /**
+     * Builds a WHERE clause at RUNTIME based on which filter fields are non-null.
+     *
+     * Specification<Course> is a functional interface: (root, query, cb) → Predicate
+     * root   = FROM Course c (entity metamodel access)
+     * query  = full CriteriaQuery builder
+     * cb     = CriteriaBuilder (factory for predicates: equal, like, gt, lt, between)
+     *
+     * JpaSpecificationExecutor.findAll(Specification, Pageable) compiles this into:
+     *   SELECT * FROM course WHERE [dynamic predicates] LIMIT ? OFFSET ?
+     */
+    public Page<Course> filterBySpecification(CourseSearchRequest req, Pageable pageable) {
+        Specification<Course> spec = (root, query, cb) -> {
+            List<Predicate> predicates = new ArrayList<>();
+
+            // Each predicate is only added when the filter field is present
+            if (req.name() != null && !req.name().isBlank()) {
+                predicates.add(
+                    cb.like(cb.lower(root.get("name")),
+                            "%" + req.name().toLowerCase() + "%")
+                );
+            }
+            if (req.credits() != null) {
+                predicates.add(cb.equal(root.get("credits"), req.credits()));
+            }
+            if (req.departmentName() != null) {
+                // Criteria JOIN — navigates the entity graph
+                Join<Course, Department> dept = root.join("department", JoinType.INNER);
+                predicates.add(cb.equal(dept.get("name"), req.departmentName()));
+            }
+            if (req.instructorLastName() != null) {
+                // Multi-level join: course → instructor(Staff) → member(Person) → lastName
+                Join<Course, Staff> instr = root.join("instructor", JoinType.LEFT);
+                predicates.add(cb.equal(instr.get("member").get("lastName"),
+                                        req.instructorLastName()));
+            }
+
+            // AND all collected predicates — cb.or(...) for OR logic
+            return cb.and(predicates.toArray(new Predicate[0]));
+        };
+
+        return courseRepo.findAll(spec, pageable);
+    }
+}
+```
+
+**Why `JpaSpecificationExecutor` over raw `@Query` for dynamic queries:**
+
+| Concern | `@Query` with null checks | `JpaSpecificationExecutor` |
+|---|---|---|
+| Optional params | `WHERE (:p IS NULL OR col = :p)` in every query — verbose | Predicate added only when non-null — clean imperative code |
+| Composability | Cannot reuse partial queries | Specifications are composable: `Specification.where(a).and(b).or(c)` |
+| Refactoring safety | String column names in SQL break silently | `root.get("credits")` — IDE navigates to entity field |
+| New filter field | Edit SQL string | Add one `if` block — no SQL editing |
+| Count for pagination | Must write separate `countQuery` | `findAll(spec, pageable)` auto-generates count query |
+
+**Enables §4.2c Strategy:** 5 (JPA Criteria / Specification)
+
+---
+
+##### Interface 3 — `QuerydslPredicateExecutor<T>`
+
+**Purpose:** Compile-time–safe dynamic queries using generated `Q-types`. The type-safe alternative to `JpaSpecificationExecutor` for complex multi-entity joins and ordering.
+
+**How Q-types work:**
+
+```
+Maven APT plugin (querydsl-apt) scans @Entity classes at compile time
+    └─▶ Generates QCourse.java in target/generated-sources/java/
+             └─▶ QCourse.course.name               ← field reference — IDE auto-complete
+             └─▶ QCourse.course.credits             ← field reference — type-checked
+             └─▶ QCourse.course.department.name     ← JOIN path — traversal type-safe
+             └─▶ QCourse.course.instructor.member.lastName   ← deep path — compile-safe
+```
+
+```java
+// CourseQueryDslRepo.java — extends BOTH JpaRepository and QuerydslPredicateExecutor
+// Note: separate interface from CourseRepo because QuerydslPredicateExecutor
+// uses a different execution path (JPAQueryFactory vs EntityManager Criteria)
+public interface CourseQueryDslRepo
+        extends JpaRepository<Course, Integer>,
+                QuerydslPredicateExecutor<Course> {   // ← adds Predicate-based findAll methods
+    // No additional method declarations needed
+    // findAll(Predicate), findAll(Predicate, Pageable), count(Predicate) all inherited
+}
+```
+
+```java
+// DynamicQueryService.java — QueryDSL side (Strategy 5 from §4.2c)
+@Service
+public class DynamicQueryService {
+
+    private final CourseQueryDslRepo courseQueryDslRepo;
+    private final JPAQueryFactory queryFactory;   // direct QueryDSL for complex joins
+
+    /**
+     * QuerydslPredicateExecutor approach — uses BooleanBuilder to compose Predicates.
+     * BooleanBuilder is an AND accumulator (or OR if you call .or() instead).
+     *
+     * Advantage over JpaSpecificationExecutor:
+     *   cb.equal(root.get("credits"), 3)     ← Criteria: "credits" is a String at definition
+     *   QCourse.course.credits.eq(3)         ← QueryDSL: .credits is Integer — type-checked
+     */
+    public Page<Course> filterByQueryDsl(CourseSearchRequest req, Pageable pageable) {
+
+        // Q-types: generated at compile time — IDE auto-complete, refactor-safe
+        QCourse course     = QCourse.course;
+        QStaff staff       = QStaff.staff;
+        QDepartment dept   = QDepartment.department;
+
+        BooleanBuilder builder = new BooleanBuilder();
+
+        if (req.name() != null && !req.name().isBlank()) {
+            // .containsIgnoreCase() → LOWER(name) LIKE '%req.name()%' — no manual lower()
+            builder.and(course.name.containsIgnoreCase(req.name()));
+        }
+        if (req.credits() != null) {
+            // .eq() generates WHERE credits = ? — Integer type enforced at compile time
+            builder.and(course.credits.eq(req.credits()));
+        }
+        if (req.minCredits() != null) {
+            // .goe() = "greater-or-equal" — no Criteria cb.greaterThanOrEqualTo() boilerplate
+            builder.and(course.credits.goe(req.minCredits()));
+        }
+        if (req.departmentName() != null) {
+            // Deep path navigation — traverses @ManyToOne join at compile-time type safety
+            builder.and(course.department.name.eq(req.departmentName()));
+        }
+        if (req.instructorLastName() != null) {
+            // Multi-hop: course → instructor → member(Person embedded) → lastName
+            builder.and(course.instructor.member.lastName.eq(req.instructorLastName()));
+        }
+
+        // QuerydslPredicateExecutor.findAll(Predicate, Pageable) — same as Specification approach
+        return courseQueryDslRepo.findAll(builder.getValue(), pageable);
+    }
+
+    /**
+     * For complex multi-join queries with aggregation, use JPAQueryFactory directly.
+     * QuerydslPredicateExecutor only handles single-entity predicates;
+     * JPAQueryFactory handles multi-entity JOINs with projection DTOs and GROUP BY.
+     *
+     * This is the QueryDSL equivalent of a complex @Query JPQL method.
+     */
+    public List<CourseDTO> findCoursesWithDeptAndInstructor(CourseSearchRequest req) {
+
+        QCourse  course = QCourse.course;
+        QStaff   staff  = QStaff.staff;
+
+        return queryFactory
+                .select(Projections.constructor(CourseDTO.class,
+                        course.id,
+                        course.name,
+                        course.credits,
+                        staff.member.firstName.concat(" ").concat(staff.member.lastName),
+                        course.department.name))
+                .from(course)
+                .join(course.instructor, staff)
+                .where(
+                    req.credits() != null ? course.credits.goe(req.credits()) : null,
+                    req.name() != null    ? course.name.containsIgnoreCase(req.name()) : null
+                )
+                .orderBy(course.credits.desc(), course.name.asc())
+                .fetch();
+    }
+}
+```
+
+**Enables §4.2c Strategy:** 5 (QueryDSL variant — type-safe Predicate)
+
+---
+
+##### Comparison — `JpaSpecificationExecutor` vs `QuerydslPredicateExecutor`
+
+| Concern | `JpaSpecificationExecutor` | `QuerydslPredicateExecutor` |
+|---|---|---|
+| **Field reference safety** | Strings at definition: `root.get("credits")` — IDE can navigate but not enforce type | **Fully compile-safe:** `QCourse.course.credits.eq(3)` — wrong type = compile error |
+| **Setup cost** | Zero — built into Spring Data JPA | APT Maven plugin + `mvn generate-sources` compile step to produce Q-types |
+| **Composability** | `Specification.where(a).and(b)` — clean functional composition | `BooleanBuilder` — mutable accumulator; also supports `.or()` |
+| **Complex JOINs** | Full `CriteriaQuery` access — any join type, subquery, GROUP BY | `QuerydslPredicateExecutor` limited to single entity; use `JPAQueryFactory` for joins |
+| **Ordering** | `cb.asc(root.get("name"))` — string-based | `QCourse.course.name.asc()` — typed `OrderSpecifier` |
+| **BETWEEN / range ops** | `cb.between(root.get("credits"), 3, 6)` | `course.credits.between(3, 6)` — cleaner syntax |
+| **NULL handling** | Explicit: `cb.isNull(root.get("field"))` | `course.field.isNull()` — same clarity |
+| **Multi-cloud / DB portability** | ✅ — JPQL-based, dialect independent | ✅ — QueryDSL generates JPQL internally |
+| **Team learning curve** | Low — familiar Java lambda + JPA metamodel | Medium — requires understanding APT code generation and Q-type conventions |
+| **Testing** | `Specification` is plain Java — isolated unit-testable | `BooleanBuilder` + `Predicate` are plain Java — also unit-testable |
+| **When to choose** | Default choice for dynamic queries; lower setup overhead | Choose when type safety on field references is a priority; large entity models where typos in field names are a real risk |
+
+---
+
+##### 4.3a Summary — Repository Design in This Project
+
+| Repository | Extends | HAL Path | Query Strategies Used (→ §4.2c) | Design Rationale |
 |---|---|---|---|---|
-| `CourseRepo` | `Course` | `JpaRepository` + `JpaSpecificationExecutor` | `/courses` | `@RepositoryRestResource`; JPQL text block queries; Specification; QBE |
-| `CourseQueryDslRepo` | `Course` | `JpaRepository` + `QuerydslPredicateExecutor` | Internal only | QueryDSL `BooleanBuilder` + APT-generated `QCourse`, `QStaff`, `QDepartment` |
-| `DepartmentRepo` | `Department` | `JpaRepository` | `/departments` | `@RepositoryRestResource`; `?projection=showChair` |
-| `StaffRepo` | `Staff` | `JpaRepository` | `/staff` | `@RepositoryRestResource`; JPQL `@Query` with `@Param` |
-| `StudentRepo` | `Student` | `JpaRepository` | `/students` | `@RepositoryRestResource`; derived methods + JPQL text blocks |
+| `CourseRepo` | `JpaRepository` + `JpaSpecificationExecutor` | `/courses` | 1 · Derived, 2 · JPQL, 4 · QBE, 5 · Criteria/Spec | Main course data access; `JpaSpecificationExecutor` enables dynamic filter endpoint |
+| `CourseQueryDslRepo` | `JpaRepository` + `QuerydslPredicateExecutor` | Internal only | 5 · QueryDSL Predicate | Demonstrates type-safe alternative path; internal use only — not HAL-exposed |
+| `DepartmentRepo` | `JpaRepository` | `/departments` | 1 · Derived | Simple CRUD + projection; no dynamic queries needed |
+| `StaffRepo` | `JpaRepository` | `/staff` | 1 · Derived, 2 · JPQL + `@Param` | `findByMemberLastName` requires embedded path navigation — `@Query` clarifies intent |
+| `StudentRepo` | `JpaRepository` | `/students` | 1 · Derived, 2 · JPQL text blocks | Enrollment logic; no dynamic filters needed currently |
+
+**Principal Rule:** Only extend `JpaSpecificationExecutor` or `QuerydslPredicateExecutor` when the repository actually needs dynamic filtering. Extending both without a clear purpose signals accidental complexity — a code review flag.
+
+---
 
 #### 4.3b — Query Method Catalog
 
