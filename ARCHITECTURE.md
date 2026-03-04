@@ -666,10 +666,22 @@ flowchart TB
         B1 -->|JAR only| B2
     end
 
-    subgraph K8S["Tier 5 — Multi-Cloud Kubernetes"]
-        EKS["AWS EKS\nElastic Kubernetes Service\nFargate or EC2 node groups\nRDS PostgreSQL / Aurora"]
-        AKS["Azure AKS\nAzure Kubernetes Service\nAzure Database for PostgreSQL\nAzure Container Registry"]
-        GKE["GCP GKE\nGoogle Kubernetes Engine\nCloud SQL PostgreSQL\nArtifact Registry"]
+    subgraph K8S["Tier 5 — Multi-Cloud Kubernetes + Managed PostgreSQL"]
+        subgraph AWS_TIER["AWS EKS"]
+            EKS["Elastic Kubernetes Service\nFargate or EC2 node groups\nALB Ingress · ECR"]
+            RDS["Amazon RDS for PostgreSQL\nMulti-AZ · Read Replicas"]
+            AURORA["Amazon Aurora PostgreSQL\nCloud-native · zero-downtime patching\nServerless v2"]
+        end
+        subgraph AZ_TIER["Azure AKS"]
+            AKS["Azure Kubernetes Service\nVirtual Machine Scale Sets\nAGIC · ACR"]
+            FLEXSRV["Azure Database for PostgreSQL\nFlexible Server\nZone-redundant HA"]
+            COSMOS_PG["Azure Cosmos DB for PostgreSQL\nCitus extension\nHorizontal sharding"]
+        end
+        subgraph GCP_TIER["GCP GKE"]
+            GKE["Google Kubernetes Engine\nAutopilot mode\nGCE Ingress · Artifact Registry"]
+            CLOUDSQL["Cloud SQL for PostgreSQL\nRegional HA · Read Replicas"]
+            ALLOYDB["AlloyDB for PostgreSQL\nCloud-native engine\nAI/ML + BigQuery integration"]
+        end
     end
 
     subgraph OBS["Observability Stack"]
@@ -797,7 +809,10 @@ spec:
 |---|---|---|---|
 | **Managed K8s control plane** | EKS (managed) | AKS (managed) | GKE Autopilot (fully managed) |
 | **Node group / compute** | EC2 Auto Scaling Groups or Fargate | Virtual Machine Scale Sets | Spot / Standard node pools or Autopilot |
-| **Managed PostgreSQL** | RDS for PostgreSQL or Aurora | Azure Database for PostgreSQL Flexible Server | Cloud SQL for PostgreSQL |
+| **Standard PostgreSQL service** | **Amazon RDS for PostgreSQL** — Multi-AZ, Read Replicas, IAM auth, DMS migration | **Azure Database for PostgreSQL — Flexible Server** — Zone-redundant HA, Azure AD auth, VNet endpoints | **Cloud SQL for PostgreSQL** — Regional HA, Read Replicas, BigQuery federation |
+| **Cloud-native PostgreSQL engine** | **Amazon Aurora (PostgreSQL-compatible)** — 6-way replication, Serverless v2, zero-downtime patching, Global Database | **Azure Cosmos DB for PostgreSQL** — Citus extension for horizontal sharding, distributed tables, columnar storage | **AlloyDB for PostgreSQL** — Google-built engine, 4× faster analytics, AI/ML integration, no-downtime major upgrades |
+| **PostgreSQL HA mechanism** | Multi-AZ: synchronous standby in separate AZ; automatic failover < 30 s | Zone-redundant: synchronous standby in paired zone; automatic failover < 120 s | Regional: primary + secondary zone; automatic failover via Cloud SQL HA |
+| **PostgreSQL key integrations** | AWS IAM DB auth, AWS DMS schema migration, Aurora zero-downtime patching | Azure AD authentication, VNet service endpoints, Azure Kubernetes Service pod identity | Vertex AI / BigQuery analytics, AlloyDB Omni (on-prem), Kubernetes Engine Workload Identity |
 | **Container registry** | Amazon ECR | Azure Container Registry (ACR) | GCP Artifact Registry |
 | **Ingress / load balancer** | AWS Load Balancer Controller (ALB) | Application Gateway Ingress Controller (AGIC) | GCE Ingress (Google Cloud LB) |
 | **Secrets management** | AWS Secrets Manager + CSI driver | Azure Key Vault + CSI driver | GCP Secret Manager + Workload Identity |
@@ -818,6 +833,75 @@ spec:
 | `management.health.livenessstate.enabled` | `true` | `true` | Enables `/actuator/health/liveness` for K8s `livenessProbe` |
 | `management.health.readinessstate.enabled` | `true` | `true` | Enables `/actuator/health/readiness` for K8s `readinessProbe` |
 | `spring.config.import` | _(not set)_ | `configserver:http://config-svc:8888` | Pull centralised config from Spring Cloud Config Server at startup |
+
+#### 4.5g — Multi-Cloud Managed PostgreSQL Deep Dive
+
+> **Architect's note:** PostgreSQL's open-source portability is the single biggest multi-cloud enabler — the JDBC driver, Spring Data JPA, and Hibernate dialect are identical across all three clouds. Only the connection URL, SSL certificate, and authentication mechanism change per environment.
+
+##### Service Tier Comparison
+
+| Feature | AWS | Azure | GCP |
+|---|---|---|---|
+| **Primary Service** | Amazon RDS for PostgreSQL | Azure Database for PostgreSQL — Flexible Server | Cloud SQL for PostgreSQL |
+| **Cloud-Native Engine** | Amazon Aurora (PostgreSQL-compatible) | Azure Cosmos DB for PostgreSQL *(Citus extension — horizontal scaling)* | AlloyDB for PostgreSQL |
+| **High Availability** | Multi-AZ deployments — synchronous standby, automatic failover | Zone-redundant or zonal HA — automatic failover with standby replica | Regional instances — primary + secondary zone, automatic failover |
+| **Key Integrations** | AWS IAM DB auth · AWS DMS · Aurora zero-downtime patching · Aurora Global Database | Azure AD authentication · VNet service endpoints · Azure Kubernetes Service pod identity | Vertex AI / ML services · BigQuery federation · AlloyDB Omni · Workload Identity |
+| **Horizontal scaling** | Aurora Parallel Query + read replicas | Cosmos DB for PostgreSQL (Citus) — coordinator + worker nodes | AlloyDB — read pool instances; Cloud Spanner (separate product) |
+| **Serverless / auto-pause** | Aurora Serverless v2 — scales to zero | Flexible Server — burstable SKU | AlloyDB — no auto-pause; Cloud SQL — no auto-pause |
+| **Max storage (auto-grow)** | 64 TB (RDS) / 128 TB (Aurora) | 32 TB (Flexible Server) | 64 TB (Cloud SQL) / unlimited (AlloyDB) |
+| **pgvector support** | ✅ RDS + Aurora | ✅ Flexible Server | ✅ AlloyDB (optimised) |
+| **Major version upgrade** | In-place upgrade (RDS) / Aurora: blue/green | In-place upgrade + read replica promotion | AlloyDB: no-downtime major upgrade; Cloud SQL: in-place |
+
+##### Portability Strategy — Spring Boot `application.properties` per Environment
+
+```properties
+# ── Local / CI (Docker Compose postgres:16) ────────────────────────────────
+spring.datasource.url=jdbc:postgresql://localhost:5432/catalog
+spring.datasource.username=user
+spring.datasource.password=pass
+
+# ── AWS RDS for PostgreSQL ──────────────────────────────────────────────────
+# spring.datasource.url=jdbc:postgresql://university.xxxx.us-east-1.rds.amazonaws.com:5432/catalog
+# spring.datasource.username=${DB_USER}          # from Secrets Manager
+# spring.datasource.password=${DB_PASSWORD}      # from Secrets Manager
+# spring.datasource.hikari.ssl=true
+
+# ── AWS Aurora (PostgreSQL-compatible) ─────────────────────────────────────
+# spring.datasource.url=jdbc:postgresql://university-cluster.cluster-xxxx.us-east-1.rds.amazonaws.com:5432/catalog
+# # Writer endpoint ↑ for writes; use reader endpoint for read-only DataSource
+
+# ── Azure Database for PostgreSQL — Flexible Server ────────────────────────
+# spring.datasource.url=jdbc:postgresql://university.postgres.database.azure.com:5432/catalog?sslmode=require
+# spring.datasource.username=appuser@university  # Azure AD token or password
+# spring.datasource.password=${AZURE_DB_PASSWORD}
+
+# ── Azure Cosmos DB for PostgreSQL (Citus) ─────────────────────────────────
+# spring.datasource.url=jdbc:postgresql://c.university.postgres.cosmos.azure.com:5432/citus?sslmode=require
+# # Coordinator node endpoint — Citus distributes queries to worker nodes transparently
+
+# ── GCP Cloud SQL for PostgreSQL ────────────────────────────────────────────
+# spring.datasource.url=jdbc:postgresql:///catalog?cloudSqlInstance=project:region:instance&socketFactory=com.google.cloud.sql.postgres.SocketFactory
+# spring.datasource.username=${DB_USER}           # from GCP Secret Manager
+# spring.datasource.password=${DB_PASSWORD}
+
+# ── GCP AlloyDB for PostgreSQL ──────────────────────────────────────────────
+# spring.datasource.url=jdbc:postgresql://10.x.x.x:5432/catalog?sslmode=require
+# # Primary IP via VPC peering; use AlloyDB Auth Proxy for Cloud-native auth
+# # Same JDBC driver — alloydb-jdbc-connector can replace Auth Proxy for K8s
+```
+
+##### Selection Guidance
+
+| Decision Driver | Recommended Service | Reason |
+|---|---|---|
+| **AWS-primary, need max performance** | Aurora PostgreSQL | 6-way replication, Serverless v2, Global Database for multi-region writes |
+| **AWS-primary, cost-sensitive / standard workload** | RDS for PostgreSQL | Simpler operations, lower cost, still enterprise-grade HA |
+| **Azure-primary, standard OLTP** | Flexible Server | Zone-redundant HA, Azure AD SSO, direct AKS pod identity integration |
+| **Azure-primary, need horizontal scale-out** | Cosmos DB for PostgreSQL (Citus) | Distribute tables across shards; scale writes beyond single-node limits |
+| **GCP-primary, analytics + AI/ML** | AlloyDB | 4× faster analytical queries, pgvector optimised for AI embeddings, BigQuery federation |
+| **GCP-primary, standard workload** | Cloud SQL for PostgreSQL | Simpler ops, Cloud SQL Auth Proxy, native GKE Workload Identity |
+| **Multi-cloud portability (all three)** | Standard PostgreSQL tier on each cloud | All three use identical open-source pg engine — same schema, same SQL, same JDBC driver; only DSN changes |
+| **AI / Vector Search** | AlloyDB (GCP) · pgvector on RDS/Aurora (AWS) · pgvector on Flexible Server (Azure) | All support `pgvector`; AlloyDB has hardware-accelerated ANN index |
 
 ---
 
@@ -853,13 +937,21 @@ flowchart TB
             TC["Testcontainers\nReal postgres:16 container\nfull schema.sql parity"]
             HLT["K8s Health Probe Tests\n/actuator/health/liveness\n/actuator/health/readiness"]
         end
+
+        subgraph L5["Layer 5 — Multi-Cloud Managed DB E2E Tests (roadmap)"]
+            RDS_T["AWS RDS / Aurora\nTestcontainers localstack\nor ephemeral RDS instance in CI"]
+            FLEX_T["Azure Flexible Server\nAzure Test Environments\nor Testcontainers pg + Azure emulator"]
+            ALLOY_T["GCP AlloyDB / Cloud SQL\nAlloyDB Omni in Testcontainers\nor Cloud SQL ephemeral in CI"]
+        end
     end
 
     H2["H2 In-Memory\nMODE=PostgreSQL\ndata.sql seeded"]
-    PG_REAL["postgres:16 container\nTestcontainers (roadmap)"]
+    PG_REAL["postgres:16 container\nTestcontainers"]
+    PG_CLOUD["Cloud-managed PostgreSQL\nRDS · Flexible Server · AlloyDB"]
 
     L2 --> H2
     L4 --> PG_REAL
+    L5 --> PG_CLOUD
 ```
 
 #### 4.6a — Test Class Summary
@@ -894,7 +986,7 @@ flowchart TB
 | `SequencedCollection.getLast()` | `SequencedCollectionTests` | Alphabetically last course name |
 | Sealed switch record deconstruct | `SealedSwitchTests` | Three distinct non-empty strings, each containing the record component value |
 
-#### 4.6d — Cloud-Readiness Test Extensions (Roadmap)
+#### 4.6d — Cloud-Readiness Test Extensions (Layer 4 Roadmap)
 
 > These test patterns are the next recommended additions to bring the test suite to production / cloud-deployment grade.
 
@@ -907,6 +999,142 @@ flowchart TB
 | Circuit Breaker fallback | `@SpringBootTest` + mock `RestClient` stub returning 500 | `describeEnrollment()` fallback invoked; Resilience4j state transitions CLOSED → OPEN | Validates fault-tolerance behavior before deploying behind Spring Cloud Gateway |
 | Config Server refresh | `@SpringBootTest` + Spring Cloud Config test harness | `@RefreshScope` beans reload on `/actuator/refresh` POST | Ensures zero-downtime config updates work in K8s without pod restart |
 
+#### 4.6e — Multi-Cloud Managed PostgreSQL E2E Testing Strategy (Layer 5 Roadmap)
+
+> **Architect's principle:** The application code is fully portable across all three cloud PostgreSQL services because Spring Data JPA / Hibernate abstracts the wire protocol. The test strategy therefore focuses on validating the **connection, SSL handshake, schema migration, and HA failover behaviour** per cloud — not re-testing business logic.
+
+```mermaid
+flowchart LR
+    subgraph LAYERS["E2E DB Test Layers"]
+        L2X["Layer 2\nH2 in-memory\nFast · zero-dependency\nCI default"]
+        L4X["Layer 4\nTestcontainers postgres:16\nReal engine · schema.sql\nCI gate before merge"]
+        L5A["Layer 5a\nAWS — RDS / Aurora\nEphemeral RDS in CI\nor LocalStack for unit"]
+        L5B["Layer 5b\nAzure — Flexible Server\nAzure Test Environments\nor pg container + Azure emulator"]
+        L5C["Layer 5c\nGCP — Cloud SQL / AlloyDB\nAlloyDB Omni container\nor ephemeral Cloud SQL in CI"]
+    end
+
+    L2X -->|passes| L4X
+    L4X -->|passes| L5A
+    L4X -->|passes| L5B
+    L4X -->|passes| L5C
+```
+
+##### Per-Cloud E2E Test Approach
+
+| Cloud | Service | Local Emulation | CI/CD Integration | Key Test Scenarios |
+|---|---|---|---|---|
+| **AWS** | RDS for PostgreSQL | `org.testcontainers:postgresql` (postgres:16 image) — identical wire protocol | GitHub Actions + `aws-actions/configure-aws-credentials`; spin up ephemeral RDS instance via Terraform, run `@SpringBootTest`, teardown | SSL/TLS connection, IAM DB auth token, Multi-AZ failover probe, schema migration via Flyway |
+| **AWS** | Aurora PostgreSQL | `org.testcontainers:postgresql` (postgres:16 image) for unit tests; real Aurora cluster for nightly E2E | Aurora reader endpoint `DataSource` bean test; Serverless v2 cold-start latency assertion; `pg_cancel_backend` zero-downtime patch simulation | Reader/writer endpoint split, Aurora Global Database replication lag |
+| **Azure** | Flexible Server | `org.testcontainers:postgresql` + `azure-identity` SDK for token-based auth simulation | Azure DevOps pipeline or GitHub Actions + `azure/login`; ARM/Bicep template deploys ephemeral Flexible Server | Zone-redundant HA failover, Azure AD token authentication with `passwordless` JDBC, VNet service endpoint connectivity |
+| **Azure** | Cosmos DB for PostgreSQL (Citus) | `org.testcontainers:postgresql` against standard pg image (Citus extension not available locally without Docker image) | `citusdata/citus` Docker image in Testcontainers for distributed table tests | Citus `create_distributed_table()` DDL, shard rebalance, coordinator + worker node topology, collocated JOIN performance |
+| **GCP** | Cloud SQL for PostgreSQL | `org.testcontainers:postgresql` for unit; Cloud SQL Auth Proxy sidecar in CI | GitHub Actions + `google-github-actions/auth`; `gcloud sql instances create` ephemeral instance; Cloud SQL Auth Proxy as service in workflow | Unix socket via Auth Proxy, Workload Identity federation, `pg_hba.conf` SSL enforcement, Read Replica lag |
+| **GCP** | AlloyDB for PostgreSQL | `google/alloydb-omni` Docker image in Testcontainers — provides AlloyDB engine locally | GCP Cloud Build + ephemeral AlloyDB cluster; AlloyDB Auth Proxy connector JAR (`alloydb-jdbc-connector`) | `pgvector` ANN index behaviour, columnar engine scan vs row scan, no-downtime major version upgrade simulation, BigQuery federated query |
+
+##### Testcontainers Configuration Template (Layer 4 → Layer 5)
+
+```java
+// src/test/java/.../config/PostgresContainerConfig.java
+@TestConfiguration
+public class PostgresContainerConfig {
+
+    // Layer 4 — standard postgres:16  (used by default in CI)
+    @Bean
+    @ConditionalOnProperty(name = "test.db.engine", havingValue = "postgres", matchIfMissing = true)
+    public PostgreSQLContainer<?> postgresContainer() {
+        return new PostgreSQLContainer<>("postgres:16")
+            .withDatabaseName("catalog")
+            .withUsername("user")
+            .withPassword("pass")
+            .withInitScript("schema.sql");   // same DDL used in production
+    }
+
+    // Layer 5c — AlloyDB Omni  (activated with -Dtest.db.engine=alloydb)
+    @Bean
+    @ConditionalOnProperty(name = "test.db.engine", havingValue = "alloydb")
+    public PostgreSQLContainer<?> alloydbOmniContainer() {
+        return new PostgreSQLContainer<>("google/alloydb-omni:latest")
+            .withDatabaseName("catalog")
+            .withUsername("user")
+            .withPassword("pass")
+            .withInitScript("schema.sql");
+    }
+
+    // Dynamic property injection — overrides spring.datasource.url at test runtime
+    @DynamicPropertySource
+    static void overrideDatasource(DynamicPropertyRegistry registry) {
+        // Container URL injected automatically by @ServiceConnection (Spring Boot 3.1+)
+        // or manually: registry.add("spring.datasource.url", container::getJdbcUrl)
+    }
+}
+```
+
+```java
+// src/test/java/.../integration/MultiCloudPostgresIT.java
+@SpringBootTest
+@ActiveProfiles("integration")
+@Testcontainers
+class MultiCloudPostgresIT {
+
+    @Container
+    @ServiceConnection                         // Spring Boot 3.1+ auto-wires DataSource
+    static PostgreSQLContainer<?> postgres =
+        new PostgreSQLContainer<>("postgres:16")   // swap to alloydb-omni for GCP tier
+            .withInitScript("schema.sql");
+
+    @Autowired CourseRepo courseRepo;
+    @Autowired DepartmentRepo departmentRepo;
+
+    @Test
+    @DisplayName("schema.sql DDL creates all six tables correctly")
+    void allTablesExist() {
+        // Verifies DDL runs clean against the real engine (not H2 approximation)
+        assertThat(courseRepo.count()).isNotNegative();
+        assertThat(departmentRepo.count()).isNotNegative();
+    }
+
+    @Test
+    @DisplayName("JPQL text block deep-path query executes against real PostgreSQL")
+    void deepPathJpqlQuery() {
+        // findByDepartmentChairMemberLastName uses a complex join path
+        // H2 MODE=PostgreSQL approximates it; real pg validates the SQL plan
+        var results = courseRepo.findByDepartmentChairMemberLastName("Smith");
+        assertThat(results).isNotNull();
+    }
+
+    @Test
+    @DisplayName("Actuator readiness probe reports UP with real DataSource")
+    void actuatorReadiness(@Autowired TestRestTemplate http) {
+        var response = http.getForEntity("/actuator/health/readiness", String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("\"status\":\"UP\"");
+    }
+}
+```
+
+##### CI/CD Pipeline — Multi-Cloud DB Test Stage
+
+```
+Pipeline Stages
+    │
+    ├─▶ 1. Unit Tests (L1)             → always  · H2 · <30 s
+    │
+    ├─▶ 2. Integration Tests (L2)      → always  · H2 · ~2 min
+    │
+    ├─▶ 3. Testcontainers Gate (L4)    → on PR   · postgres:16 · ~4 min
+    │       ↓ passes
+    ├─▶ 4a. AWS E2E (L5a)              → nightly · ephemeral RDS · ~15 min
+    │         SPRING_PROFILES=aws-rds
+    │         DB URL from Secrets Manager
+    │
+    ├─▶ 4b. Azure E2E (L5b)            → nightly · ephemeral Flexible Server · ~15 min
+    │         SPRING_PROFILES=azure-flexsrv
+    │         passwordless JDBC + Azure AD token
+    │
+    └─▶ 4c. GCP E2E (L5c)              → nightly · AlloyDB Omni container · ~10 min
+              SPRING_PROFILES=gcp-alloydb
+              alloydb-jdbc-connector
+```
+
 ---
 
-*Generated 2026-03-04 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.3.5 · Spring Cloud · AWS EKS · Azure AKS · GCP GKE)*
+*Generated 2026-03-04 · Principal architect analysis of `university-modern` (Java 17/21 + Spring Boot 3.3.5 · Spring Cloud · AWS EKS/RDS/Aurora · Azure AKS/Flexible Server/Cosmos DB for PostgreSQL · GCP GKE/Cloud SQL/AlloyDB)*
